@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "attackmap-analyzer-c"
+version = "0.1.0"
+description = "C ecosystem analyzer plugin for AttackMap (libmicrohttpd, civetweb, mongoose; libcurl; OpenSSL/mbedTLS/libsodium; sqlite3/libpq/mysql/hiredis/mongoc)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+  {name = "AttackMap Contributors"}
+]
+dependencies = [
+  "pydantic>=2.7.0",
+]
+
+[project.optional-dependencies]
+core = [
+  "attackmap>=0.1.0",
+]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.entry-points."attackmap.analyzers"]
+c = "attackmap_analyzer_c:CAnalyzer"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

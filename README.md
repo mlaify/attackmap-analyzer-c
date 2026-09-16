@@ -1,5 +1,10 @@
 # attackmap-analyzer-c
 
+> [!NOTE]
+> **Development is paused.** This project is not under active development.
+> The code remains available for reference, and security reports are still
+> welcome at [security@mlaify.io](mailto:security@mlaify.io).
+
 C ecosystem analyzer for [AttackMap](https://github.com/mlaify/AttackMap).
 
 C is more fragmented than language-specific ecosystems — there's no dominant web framework, and routing patterns vary widely. This analyzer captures what regex can reach reliably from common third-party libraries.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -387,3 +388,72 @@ def test_full_civetweb_service_signal_set(tmp_path: Path) -> None:
     assert any(f.hint == "civetweb" for f in result.framework_hints)
     assert any(e.hint == "civetweb_start" for e in result.entrypoint_hints)
     assert any(h.hint == "project:demo-svc" for h in result.service_hints)
+
+
+# ---------- Repo walking (AttackMap#253) ----------
+
+_WALK_FIXTURE = (
+    '#include <civetweb.h>\n'
+    '#include <stdlib.h>\n'
+    'int main(void) {\n'
+    '    const char *jwt = getenv("JWT_SECRET");\n'
+    '    struct mg_context *ctx = mg_start(NULL, NULL, NULL);\n'
+    '    mg_set_request_handler(ctx, "/login", login_handler, NULL);\n'
+    '    return 0;\n'
+    '}\n'
+)
+
+
+def test_repo_under_skip_dir_named_parents_is_analyzed(tmp_path: Path) -> None:
+    """A checkout under /.../build/out/... must not be skipped (absolute-path bug)."""
+    repo = tmp_path / "build" / "out" / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "main.c").write_text(_WALK_FIXTURE, encoding="utf-8")
+    analyzer = CAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == 1
+    assert {r.path for r in result.routes} == {"/login"}
+    assert any(s.name == "JWT_SECRET" and s.file == "src/main.c" for s in result.secret_hints)
+
+
+def test_skip_dirs_inside_repo_still_skipped(tmp_path: Path) -> None:
+    for skipped in ("build", "third_party", "_deps"):
+        (tmp_path / skipped).mkdir()
+        (tmp_path / skipped / "dep.c").write_text(_WALK_FIXTURE, encoding="utf-8")
+    result = CAnalyzer().analyze(tmp_path)
+    assert result.files_scanned == 0
+    assert result.routes == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_source_outside_repo_not_analyzed(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.c").write_text('const char *k = getenv("OUTSIDE_SECRET_KEY");\n', encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    (repo / "linked.c").symlink_to(outside / "secret.c")
+    result = CAnalyzer().analyze(repo)
+    assert result.files_scanned == 1
+    assert result.secret_hints == []
+
+
+def test_cp1252_source_is_analyzed(tmp_path: Path) -> None:
+    (tmp_path / "legacy.c").write_bytes(
+        (
+            '/* Gestion des accès — café */\n'
+            '#include <stdlib.h>\n'
+            'const char *pw = getenv("DB_PASSWORD");\n'
+        ).encode("cp1252")
+    )
+    result = CAnalyzer().analyze(tmp_path)
+    assert result.files_scanned == 1
+    secret = next(s for s in result.secret_hints if s.name == "DB_PASSWORD")
+    assert secret.line == 3
+
+
+def test_experimental_analyzer_is_opt_in() -> None:
+    assert CAnalyzer.metadata.experimental is True
+    assert CAnalyzer.metadata.enabled_by_default is False

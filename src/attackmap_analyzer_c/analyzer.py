@@ -24,6 +24,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -38,17 +40,10 @@ from .contracts import (
 )
 
 CODE_SUFFIXES = {".c", ".h"}
-SKIP_DIRS = {
-    "build",
-    ".git",
-    "_deps",
-    "third_party",
-    "vendor",
-    "external",
-    ".cache",
-    "out",
-    "node_modules",
-}
+# C-specific additions to the shared skip list (which already covers build/,
+# out/, vendor/, node_modules/, .git/, ...). Matched against directory names
+# *inside* the repo only.
+SKIP_DIRS = DEFAULT_SKIP_DIRS | {"_deps", "third_party", "external", ".cache"}
 _SNIPPET_MAX_CHARS = 160
 
 
@@ -134,13 +129,11 @@ SECRET_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
-def _line_of(content: str, offset: int) -> int:
-    if offset <= 0:
-        return 1
-    return content.count("\n", 0, offset) + 1
-
-
 def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CHARS) -> str:
+    # Kept local rather than ``attackmap.sdk.line_snippet(content, line_of(...))``:
+    # the SDK helper indexes ``str.splitlines()``, which also breaks on form
+    # feeds (common in legacy C) and lone ``\r``, so its line numbering can
+    # disagree with ``line_of`` (which counts ``\n`` only).
     line_start = content.rfind("\n", 0, offset) + 1
     line_end = content.find("\n", offset)
     if line_end == -1:
@@ -152,11 +145,8 @@ def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CH
 
 
 def _project_name_from_cmake(cmake_path: Path) -> str | None:
-    if not cmake_path.exists():
-        return None
-    try:
-        text = cmake_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+    text = read_source(cmake_path)
+    if text is None:
         return None
     match = re.search(r"\bproject\s*\(\s*([A-Za-z0-9_\-]+)", text)
     if match:
@@ -175,7 +165,7 @@ class CAnalyzer:
         languages=["c"],
         priority=20,
         experimental=True,  # C ecosystem coverage is heuristic and partial; mark experimental.
-        enabled_by_default=True,
+        enabled_by_default=False,  # opt-in via `-m c` while experimental (AttackMap#221)
     )
 
     @property
@@ -188,21 +178,13 @@ class CAnalyzer:
         root = Path(repo_path).resolve()
         if not root.exists() or not root.is_dir():
             return False
-        for path in root.rglob("*"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            if not path.is_file():
-                continue
+        # Any .c/.h file claims the repo. A CMakeLists.txt/Makefile on its own
+        # does not: a CMake project with only .cpp sources belongs to the C++
+        # analyzer. Suffixes are matched case-sensitively (``.C``/``.H`` are
+        # C++ conventions), so filter after the case-insensitive SDK match.
+        for path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
             if path.suffix in CODE_SUFFIXES:
                 return True
-            if path.name in {"CMakeLists.txt", "Makefile"}:
-                # Disambiguate: a CMake project may be C++ rather than C. Only return True
-                # when there's at least one .c file alongside it; otherwise let the C++
-                # analyzer claim the repo.
-                for sibling in path.parent.rglob("*.c"):
-                    if any(part in SKIP_DIRS for part in sibling.parts):
-                        continue
-                    return True
         return False
 
     def analyze(self, repo_path: str | Path) -> ScanResult:
@@ -211,31 +193,25 @@ class CAnalyzer:
         if not root.exists() or not root.is_dir():
             return result
 
-        for cmake in root.rglob("CMakeLists.txt"):
-            if any(part in SKIP_DIRS for part in cmake.parts):
-                continue
-            project = _project_name_from_cmake(cmake)
-            if project:
-                self._append_unique_service(result, f"project:{project}", str(cmake.relative_to(root)))
-
-        for file_path in root.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
+        for file_path in iter_repo_files(
+            root, suffixes=CODE_SUFFIXES, names={"CMakeLists.txt"}, skip_dirs=SKIP_DIRS
+        ):
+            if file_path.name == "CMakeLists.txt":
+                project = _project_name_from_cmake(file_path)
+                if project:
+                    self._append_unique_service(result, f"project:{project}", rel(file_path, root))
                 continue
             if file_path.suffix not in CODE_SUFFIXES:
+                continue
+            content = read_source(file_path)
+            if content is None:
                 continue
 
             result.files_scanned += 1
             if "c" not in result.languages:
                 result.languages.append("c")
 
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-
-            relative = str(file_path.relative_to(root))
+            relative = rel(file_path, root)
             self._extract_routes(content, relative, result)
             self._extract_databases(content, relative, result)
             self._extract_auth(content, relative, result)
@@ -252,13 +228,13 @@ class CAnalyzer:
     def _extract_routes(self, content: str, relative: str, result: ScanResult) -> None:
         for match in CIVETWEB_ROUTE_PATTERN.finditer(content):
             path = match.group(1)
-            self._append_unique_route(result, path, "ANY", relative, _line_of(content, match.start()))
+            self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
         for match in MONGOOSE_MATCH_URI_PATTERN.finditer(content):
             path = match.group(1)
-            self._append_unique_route(result, path, "ANY", relative, _line_of(content, match.start()))
+            self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
         for match in ONION_ROUTE_PATTERN.finditer(content):
             path = match.group(1)
-            self._append_unique_route(result, path, "ANY", relative, _line_of(content, match.start()))
+            self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
@@ -267,7 +243,7 @@ class CAnalyzer:
                 continue
             self._append_unique_database(
                 result, kind, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -278,7 +254,7 @@ class CAnalyzer:
                 continue
             self._append_unique_auth(
                 result, hint, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
                 confidence,
             )
@@ -289,7 +265,7 @@ class CAnalyzer:
                 name = match.group(1)
                 self._append_unique_secret(
                     result, name, relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -298,7 +274,7 @@ class CAnalyzer:
             target = match.group(1)
             self._append_unique_external(
                 result, target, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -309,7 +285,7 @@ class CAnalyzer:
                 continue
             self._append_unique_framework(
                 result, name, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -320,7 +296,7 @@ class CAnalyzer:
                 continue
             self._append_unique_entrypoint(
                 result, hint, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 

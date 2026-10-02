@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `.h` headers in C++ repos are no longer analyzed as C. Ownership is decided per repo by the rule shared with attackmap-analyzer-cpp: any C++ source/header or a C++-enabled `CMakeLists.txt` makes `.h` C++'s, otherwise it is C's. Drogon controllers declared in `.h` stop being labelled language `c` (#2).
+- `detect()` requires at least one `.c` file. A lone `.h`, such as an ObjC/Swift bridging header or a Python C-extension header, no longer triggers the C analyzer (#2).
+- `detect()` makes one walk. The quadratic nested `rglob("*.c")` per `CMakeLists.txt`/`Makefile` was already removed by the `attackmap.sdk` walker migration above; a regression test now asserts a single `os.walk` and no `rglob` (#2).
 - A repo checked out under a directory named like a skip dir (e.g. `/build/...`, `.../out/...`) was silently not analyzed, because skip dirs were matched against absolute path parts.
 - Symlinked files pointing outside the repo are no longer followed and analyzed.
 - cp1252/latin-1 encoded sources are analyzed instead of silently dropped, and an unreadable file no longer raises out of `analyze()`.

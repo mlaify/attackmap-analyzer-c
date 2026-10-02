@@ -18,8 +18,15 @@ def test_detect_picks_up_c_file(tmp_path: Path) -> None:
     assert CAnalyzer().detect(tmp_path) is True
 
 
-def test_detect_picks_up_header_file(tmp_path: Path) -> None:
+def test_detect_lone_header_does_not_claim(tmp_path: Path) -> None:
+    """A .h on its own is not a C project (#2)."""
     (tmp_path / "api.h").write_text("#pragma once\nint foo(void);\n", encoding="utf-8")
+    assert CAnalyzer().detect(tmp_path) is False
+
+
+def test_detect_header_with_c_source_claims(tmp_path: Path) -> None:
+    (tmp_path / "api.h").write_text("#pragma once\nint foo(void);\n", encoding="utf-8")
+    (tmp_path / "api.c").write_text('#include "api.h"\nint foo(void) { return 0; }\n', encoding="utf-8")
     assert CAnalyzer().detect(tmp_path) is True
 
 
@@ -457,3 +464,183 @@ def test_cp1252_source_is_analyzed(tmp_path: Path) -> None:
 def test_experimental_analyzer_is_opt_in() -> None:
     assert CAnalyzer.metadata.experimental is True
     assert CAnalyzer.metadata.enabled_by_default is False
+
+
+# ---------- #2: .h ownership with the C++ analyzer, one-walk detect ----------
+
+_DROGON_CONTROLLER_H = """#pragma once
+
+#include <drogon/HttpController.h>
+
+using namespace drogon;
+
+namespace api
+{
+namespace v1
+{
+class User : public drogon::HttpController<User>
+{
+  public:
+    METHOD_LIST_BEGIN
+    METHOD_ADD(User::getInfo, "/{id}", Get);
+    ADD_METHOD_TO(User::login, "/api/v1/login", Post);
+    METHOD_LIST_END
+};
+}  // namespace v1
+}  // namespace api
+"""
+
+
+def _write_tree(root: Path, files: dict[str, str]) -> None:
+    for name, text in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"controllers/api_v1_User.cc": '#include "api_v1_User.h"\n'},
+        {"CMakeLists.txt": "project(app CXX)\n"},
+    ],
+    ids=["with-cc-source", "header-only-cmake-cxx"],
+)
+def test_drogon_header_controller_yields_nothing_from_c(tmp_path: Path, extra: dict[str, str]) -> None:
+    _write_tree(tmp_path, {"controllers/api_v1_User.h": _DROGON_CONTROLLER_H, **extra})
+    analyzer = CAnalyzer()
+    assert analyzer.detect(tmp_path) is False
+    result = analyzer.analyze(tmp_path)
+    assert result.routes == []
+    assert result.files_scanned == 0
+    assert result.languages == []
+    assert result.framework_hints == []
+
+
+def test_bridging_header_only_repo_does_not_trigger_c(tmp_path: Path) -> None:
+    _write_tree(
+        tmp_path,
+        {
+            "App/App-Bridging-Header.h": '#import "MyLib.h"\n',
+            "App/AppDelegate.swift": "import UIKit\n",
+        },
+    )
+    assert CAnalyzer().detect(tmp_path) is False
+
+
+def test_detect_performs_a_single_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The old detect() ran a nested ``rglob("*.c")`` per CMakeLists.txt /
+    Makefile, quadratic on large trees. Worst case (no .c, many build files):
+    exactly one os.walk and no rglob."""
+    import os
+
+    files: dict[str, str] = {}
+    for i in range(20):
+        files[f"mod{i}/CMakeLists.txt"] = f"project(mod{i} CXX)\n"
+        files[f"mod{i}/Makefile"] = "all:\n"
+        files[f"mod{i}/src/x{i}.cpp"] = "int x() { return 0; }\n"
+    _write_tree(tmp_path, files)
+
+    walks: list[object] = []
+    real_walk = os.walk
+
+    def counting_walk(*args, **kwargs):
+        walks.append(args[0] if args else kwargs.get("top"))
+        return real_walk(*args, **kwargs)
+
+    rglobs: list[str] = []
+    real_rglob = Path.rglob
+
+    def counting_rglob(self, pattern, *args, **kwargs):
+        rglobs.append(pattern)
+        return real_rglob(self, pattern, *args, **kwargs)
+
+    monkeypatch.setattr(os, "walk", counting_walk)
+    monkeypatch.setattr(Path, "rglob", counting_rglob)
+
+    assert CAnalyzer().detect(tmp_path) is False
+    assert len(walks) == 1
+    assert rglobs == []
+
+
+def test_analyze_performs_a_single_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    _write_tree(
+        tmp_path,
+        {
+            "CMakeLists.txt": "project(app C CXX)\n",
+            "src/a.c": "int a(void) { return 0; }\n",
+            "src/b.cpp": "int b() { return 0; }\n",
+            "include/a.h": "int a(void);\n",
+        },
+    )
+    walks: list[object] = []
+    real_walk = os.walk
+
+    def counting_walk(*args, **kwargs):
+        walks.append(args[0] if args else kwargs.get("top"))
+        return real_walk(*args, **kwargs)
+
+    monkeypatch.setattr(os, "walk", counting_walk)
+    CAnalyzer().analyze(tmp_path)
+    assert len(walks) == 1
+
+
+# The .h ownership rule, mirrored case-for-case in attackmap-analyzer-cpp's
+# tests: (files besides a.c + inc/api.h, owner of inc/api.h).
+_OWNERSHIP_CASES = [
+    ({}, "c"),
+    ({"CMakeLists.txt": "project(lib C)\n"}, "c"),
+    ({"CMakeLists.txt": "project(lib)\n"}, "c"),
+    ({"CMakeLists.txt": "cmake_minimum_required(VERSION 3.10)\nproject(lib VERSION 1.0 LANGUAGES CXX)\n"}, "cpp"),
+    ({"CMakeLists.txt": "PROJECT(lib C CXX)\n"}, "cpp"),
+    ({"CMakeLists.txt": "project(lib C)\nenable_language(CXX)\n"}, "cpp"),
+    ({"CMakeLists.txt": "project(lib C)\nset(CMAKE_CXX_STANDARD 17)\n"}, "cpp"),
+    ({"sub/CMakeLists.txt": "project(sub CXX)\n"}, "cpp"),
+    ({"src/server.cpp": "int main() {}\n"}, "cpp"),
+    ({"src/server.cc": "int main() {}\n"}, "cpp"),
+    ({"src/server.cxx": "int main() {}\n"}, "cpp"),
+    ({"inc/util.hpp": "#pragma once\n"}, "cpp"),
+    # Pruned by one of the two plugins: never a marker for either.
+    ({"build/gen.cpp": "int g() {}\n"}, "c"),
+    ({"third_party/lib/x.cc": "int x() {}\n"}, "c"),
+    ({"Release/gen.cpp": "int g() {}\n"}, "c"),
+    ({"Debug/CMakeLists.txt": "project(dbg CXX)\n"}, "c"),
+]
+
+
+@pytest.mark.parametrize(("extra", "owner"), _OWNERSHIP_CASES)
+def test_header_ownership_rule(tmp_path: Path, extra: dict[str, str], owner: str) -> None:
+    _write_tree(
+        tmp_path,
+        {
+            "a.c": '#include "inc/api.h"\nint main(void) { return 0; }\n',
+            "inc/api.h": '#pragma once\nstatic const char *k(void) { return getenv("API_TOKEN"); }\n',
+            **extra,
+        },
+    )
+    result = CAnalyzer().analyze(tmp_path)
+    scanned_header = any(s.file == "inc/api.h" and s.name == "API_TOKEN" for s in result.secret_hints)
+    assert scanned_header is (owner == "c")
+    # The .c source is always C's, whoever owns the headers.
+    assert "c" in result.languages
+
+
+def test_pure_c_project_headers_still_analyzed(tmp_path: Path) -> None:
+    _write_tree(
+        tmp_path,
+        {
+            "CMakeLists.txt": "project(cproj C)\n",
+            "server.c": '#include "routes.h"\nint main(void) { return 0; }\n',
+            "routes.h": (
+                "#pragma once\n#include <civetweb.h>\n"
+                "static inline void add_routes(struct mg_context *ctx) {\n"
+                '    mg_set_request_handler(ctx, "/api/items", items_handler, NULL);\n'
+                "}\n"
+            ),
+        },
+    )
+    result = CAnalyzer().analyze(tmp_path)
+    assert [(r.path, r.file) for r in result.routes] == [("/api/items", "routes.h")]
+    assert result.files_scanned == 2

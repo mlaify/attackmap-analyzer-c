@@ -39,7 +39,17 @@ attackmap analyze /path/to/c/repo -m c
 
 ## Detection
 
-`detect()` returns true when any `.c` or `.h` file is present in the tree, ignoring `_deps/`, `third_party/`, `external/`, `.cache/` and AttackMap's shared skip list (`build/`, `out/`, `vendor/`, `node_modules/`, `.git/`, ...). Skip directories are matched only *inside* the repo, so a checkout under e.g. `/build/...` is still scanned. Files are walked with `attackmap.sdk.iter_repo_files`, which does not follow symlinks out of the repo, and read with `read_source`, which falls back to cp1252/latin-1 for legacy-encoded sources. A `CMakeLists.txt` alongside `.cpp` files (and no `.c` files) is **not** claimed by this analyzer — that's the C++ analyzer's territory.
+`detect()` returns true when at least one `.c` file is present in the tree (a lone `.h`, such as an ObjC/Swift bridging header, doesn't count), in a single walk, ignoring `_deps/`, `third_party/`, `external/`, `.cache/` and AttackMap's shared skip list (`build/`, `out/`, `vendor/`, `node_modules/`, `.git/`, ...). Skip directories are matched only *inside* the repo, so a checkout under e.g. `/build/...` is still scanned. Files are walked with `attackmap.sdk.iter_repo_files`, which does not follow symlinks out of the repo, and read with `read_source`, which falls back to cp1252/latin-1 for legacy-encoded sources. A `CMakeLists.txt` alongside `.cpp` files (and no `.c` files) is **not** claimed by this analyzer — that's the C++ analyzer's territory.
+
+### `.h` ownership
+
+`.h` ownership is decided per repo, by the same rule in both the C and C++ analyzers, so exactly one of them analyzes each header whichever of `-m c` / `-m cpp` is selected:
+
+- `.h` belongs to **C++** if the repo has any C++ source or header (`.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.ipp`, `.tpp`) or a `CMakeLists.txt` that enables CXX (`project(... CXX ...)`, `enable_language(CXX)` or `CMAKE_CXX_STANDARD`). A bare `project(foo)` doesn't count.
+- Otherwise `.h` belongs to **C**.
+- Files under directories either plugin prunes (`build/`, `third_party/`, `Debug/`, `Release/`, ...) are never markers.
+
+In a mixed repo, `.c` files go to C, and `.cpp`/`.hpp`/... plus `.h` go to C++. Running only one of the two analyzers on a mixed repo leaves the other's files unanalyzed. It never double-counts them.
 
 ## Coverage notes
 

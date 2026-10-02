@@ -44,6 +44,30 @@ CODE_SUFFIXES = {".c", ".h"}
 # out/, vendor/, node_modules/, .git/, ...). Matched against directory names
 # *inside* the repo only.
 SKIP_DIRS = DEFAULT_SKIP_DIRS | {"_deps", "third_party", "external", ".cache"}
+
+# ---------- .h ownership (shared rule with attackmap-analyzer-cpp) ----------
+#
+# A ``.h`` header is either C or C++, and only one analyzer may claim it, or a
+# C++ project's headers (e.g. Drogon controllers, whose routes live in the
+# header) get analyzed as C and labelled language ``c``. The rule is decided
+# per repo and is mirrored *verbatim* in attackmap-analyzer-cpp, so both
+# plugins agree whichever of ``-m c`` / ``-m cpp`` is selected:
+#
+#   ``.h`` belongs to C++ if the repo has any C++ source/header (the suffixes
+#   below) or a CMakeLists.txt that enables CXX (``project(... CXX ...)``,
+#   ``enable_language(CXX)`` or ``CMAKE_CXX_STANDARD``); otherwise to C.
+#
+# Keep ``_CXX_MARKER_SUFFIXES``, ``_CMAKE_CXX_PATTERN`` and
+# ``_OWNERSHIP_EXTRA_SKIP_DIRS`` in sync with the cpp plugin.
+_CXX_MARKER_SUFFIXES = {".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".ipp", ".tpp"}
+_CMAKE_CXX_PATTERN = re.compile(
+    r"\b(?i:project)\s*\([^)]*\bCXX\b"
+    r"|\b(?i:enable_language)\s*\(\s*CXX\b"
+    r"|\bCMAKE_CXX_STANDARD\b",
+)
+# The cpp plugin also prunes these; ignore C++ markers under them here too so
+# both plugins see the same marker set.
+_OWNERSHIP_EXTRA_SKIP_DIRS = {"Debug", "Release"}
 _SNIPPET_MAX_CHARS = 160
 
 
@@ -144,14 +168,16 @@ def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CH
     return line
 
 
-def _project_name_from_cmake(cmake_path: Path) -> str | None:
-    text = read_source(cmake_path)
-    if text is None:
-        return None
+def _project_name_from_cmake(text: str) -> str | None:
     match = re.search(r"\bproject\s*\(\s*([A-Za-z0-9_\-]+)", text)
     if match:
         return match.group(1)
     return None
+
+
+def _counts_for_ownership(path: Path, root: Path) -> bool:
+    parents = Path(rel(path, root)).parts[:-1]
+    return not any(part in _OWNERSHIP_EXTRA_SKIP_DIRS for part in parents)
 
 
 class CAnalyzer:
@@ -178,12 +204,13 @@ class CAnalyzer:
         root = Path(repo_path).resolve()
         if not root.exists() or not root.is_dir():
             return False
-        # Any .c/.h file claims the repo. A CMakeLists.txt/Makefile on its own
-        # does not: a CMake project with only .cpp sources belongs to the C++
-        # analyzer. Suffixes are matched case-sensitively (``.C``/``.H`` are
-        # C++ conventions), so filter after the case-insensitive SDK match.
-        for path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
-            if path.suffix in CODE_SUFFIXES:
+        # One walk; at least one ``.c`` source claims the repo. A lone ``.h``
+        # (an ObjC/Swift bridging header, a Python C-extension header) or a
+        # CMakeLists.txt/Makefile on its own does not. Suffixes are matched
+        # case-sensitively (``.C`` is a C++ convention), so filter after the
+        # case-insensitive SDK match.
+        for path in iter_repo_files(root, suffixes={".c"}, skip_dirs=SKIP_DIRS):
+            if path.suffix == ".c":
                 return True
         return False
 
@@ -193,16 +220,36 @@ class CAnalyzer:
         if not root.exists() or not root.is_dir():
             return result
 
+        # One walk collects sources, CMake files and the C++ markers that
+        # decide .h ownership (see the module-level rule above).
+        sources: list[Path] = []
+        cxx_repo = False
         for file_path in iter_repo_files(
-            root, suffixes=CODE_SUFFIXES, names={"CMakeLists.txt"}, skip_dirs=SKIP_DIRS
+            root,
+            suffixes=CODE_SUFFIXES | _CXX_MARKER_SUFFIXES,
+            names={"CMakeLists.txt"},
+            skip_dirs=SKIP_DIRS,
         ):
             if file_path.name == "CMakeLists.txt":
-                project = _project_name_from_cmake(file_path)
+                text = read_source(file_path)
+                if text is None:
+                    continue
+                project = _project_name_from_cmake(text)
                 if project:
                     self._append_unique_service(result, f"project:{project}", rel(file_path, root))
+                if _CMAKE_CXX_PATTERN.search(text) and _counts_for_ownership(file_path, root):
+                    cxx_repo = True
                 continue
-            if file_path.suffix not in CODE_SUFFIXES:
+            if file_path.suffix in _CXX_MARKER_SUFFIXES:
+                if _counts_for_ownership(file_path, root):
+                    cxx_repo = True
                 continue
+            if file_path.suffix in CODE_SUFFIXES:
+                sources.append(file_path)
+
+        for file_path in sources:
+            if file_path.suffix == ".h" and cxx_repo:
+                continue  # owned by the C++ analyzer
             content = read_source(file_path)
             if content is None:
                 continue

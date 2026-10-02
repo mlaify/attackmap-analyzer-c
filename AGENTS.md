@@ -42,7 +42,17 @@ This analyzer is marked `experimental=True` on its metadata because:
 - Keyword sweeps (`Authorization`, `Bearer`, `api_key`) → 0.6
 
 ## C-vs-C++ disambiguation
-A repo with a `CMakeLists.txt` next to `.cpp` files but no `.c` files is **not** claimed by this analyzer; the C++ analyzer (`attackmap-analyzer-cpp`) takes precedence. A repo with both `.c` and `.cpp` files is claimed by both — and AttackMap's overlay merges results.
+`detect()` needs at least one `.c` file. A lone `.h` or a `CMakeLists.txt` next to `.cpp` files (and no `.c`) is **not** claimed; the C++ analyzer (`attackmap-analyzer-cpp`) takes those. A repo with both `.c` and `.cpp` files is claimed by both, and each analyzes only the files it owns.
+
+`.h` ownership is decided per repo, by the same rule in both the C and C++ analyzers, so exactly one of them analyzes each header whichever of `-m c` / `-m cpp` is selected:
+
+- `.h` belongs to **C++** if the repo has any C++ source or header (`.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.ipp`, `.tpp`) or a `CMakeLists.txt` that enables CXX (`project(... CXX ...)`, `enable_language(CXX)` or `CMAKE_CXX_STANDARD`). A bare `project(foo)` doesn't count.
+- Otherwise `.h` belongs to **C**.
+- Files under directories either plugin prunes (`build/`, `third_party/`, `Debug/`, `Release/`, ...) are never markers.
+
+In a mixed repo, `.c` files go to C, and `.cpp`/`.hpp`/... plus `.h` go to C++. Running only one of the two analyzers on a mixed repo leaves the other's files unanalyzed. It never double-counts them.
+
+The rule's constants (`_CXX_MARKER_SUFFIXES`, `_CMAKE_CXX_PATTERN`, `_OWNERSHIP_EXTRA_SKIP_DIRS`) are mirrored in attackmap-analyzer-cpp. `test_header_ownership_rule` uses the same case table in both repos. Change both together.
 
 ## Testing
 Each new extractor needs both a positive test and a negative test (e.g., `getenv("HOME")` is NOT a secret; `curl_easy_setopt(curl, CURLOPT_URL, "/local/path")` is NOT an external call).

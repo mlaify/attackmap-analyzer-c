@@ -355,6 +355,11 @@ _MHD_REQUEST_PARAMS = frozenset({"url", "method", "version", "upload_data", "upl
 _OATPP_PARAM_RE = re.compile(r"\b(?:QUERY|PATH|HEADER|BODY_STRING|BODY_DTO)\s*\(\s*[^,()]{1,120},\s*([A-Za-z_]\w*)")
 _ARGV_PARAM_RE = re.compile(r"\bargv\b")
 _ARGV_USE_RE = re.compile(r"\bargv\s*\[|\boptarg\b")
+# `std::string t(req.target());` / `std::string s{buf};`: direct-initialized
+# strings take their argument's data like an assignment.
+_STRING_CTOR_DECL_RE = re.compile(
+    r"\b(?:std::)?(?:string|wstring|string_view|basic_string\s*<[^<>;\n]{0,40}>)\s+([A-Za-z_]\w*)\s*[({]"
+)
 _CIN_RE = re.compile(r"\b(?:std::)?(?:cin|wcin)\s*>>\s*([A-Za-z_]\w*)")
 _GETLINE_CIN_RE = re.compile(r"\b(?:std::)?getline\s*\(\s*(?:std::)?(?:cin|wcin)\s*,\s*([A-Za-z_]\w*)")
 
@@ -817,6 +822,8 @@ def _scope_hits(masked: str, orig: str, scope: _Scope, file_constants: set[str])
         events.append((match.start(), 2, match))
     for match in _NEW_ARRAY_RE.finditer(masked, body_lo, body_hi):
         events.append((match.start(), 3, match))
+    for match in _STRING_CTOR_DECL_RE.finditer(masked, body_lo, body_hi):
+        events.append((match.end() - 1, 4, match))
     for match in _RESIZE_RE.finditer(masked, body_lo, body_hi):
         state.resized.setdefault(match.group(1), []).append(match.start())
     events.sort(key=lambda e: (e[0], e[1]))
@@ -829,6 +836,8 @@ def _scope_hits(masked: str, orig: str, scope: _Scope, file_constants: set[str])
             hits.extend(_on_call(ctx, match))
         elif etype == 2:
             state.add(match.group(1), match.end(), _Taint("stdin", line_of(orig, match.start())))
+        elif etype == 4:
+            _on_string_ctor(ctx, match)
         else:
             hit = _on_new_array(ctx, match)
             if hit is not None:
@@ -888,6 +897,25 @@ def _on_assign(ctx: _Ctx, match: re.Match[str]) -> None:
         return
     numeric = taint.numeric or name in ctx.int_vars or numeric_rhs
     ctx.state.add(name, rhs_lo, _Taint(taint.kind, taint.line, numeric, taint.bounded, taint.max_len))
+
+
+def _on_string_ctor(ctx: _Ctx, match: re.Match[str]) -> None:
+    open_index = match.end() - 1
+    close_char = ")" if ctx.masked[open_index] == "(" else "}"
+    depth = 0
+    for i in range(open_index, min(len(ctx.masked), open_index + _MAX_RHS_SPAN)):
+        c = ctx.masked[i]
+        if c in "({[":
+            depth += 1
+        elif c in ")}]":
+            depth -= 1
+            if depth == 0:
+                if c != close_char:
+                    return
+                taint = _expr_taint(ctx, open_index + 1, i, want_string=True)
+                if taint is not None:
+                    ctx.state.add(match.group(1), i, taint)
+                return
 
 
 def _resolve_kind(spec: str, ctx: _Ctx, args: list[tuple[int, int]]) -> str | None:

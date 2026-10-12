@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Native dependency inventory (mlaify/AttackMap#191).** A new `native_deps.py`, shared verbatim with attackmap-analyzer-cpp, emits `DependencyHint`s from:
+  - `vcpkg.json`: dependencies, `version>=`, `overrides`, `host`, `builtin-baseline`;
+  - Conan: `conanfile.txt`, `conanfile.py` (read as text, never executed) and `conan.lock`;
+  - CMake: `FetchContent_Declare`, `ExternalProject_Add`, `CPMAddPackage` and `find_package`.
+
+  `--cve` now reaches Conan and vcpkg dependencies. CMake ones are inventory-only. Git downloads on a branch or with no `GIT_TAG`, and archive URLs without `URL_HASH`, are reported as `mutable_vcs_dependency` supply-chain issues. Requires an AttackMap core with the `cmake` ecosystem and `SupplyChainIssue` in `attackmap.sdk` (mlaify/AttackMap#333).
+
 ### Changed
 
 - Walk and read the repo with the shared `attackmap.sdk` helpers (`iter_repo_files`, `read_source`, `rel`, `line_of`) instead of a local `rglob` + `SKIP_DIRS` walk (mlaify/AttackMap#253).

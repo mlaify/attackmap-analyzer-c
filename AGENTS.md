@@ -22,6 +22,7 @@ C ecosystem coverage:
 - **Databases**: sqlite3, libpq, MySQL/MariaDB C client, hiredis, MongoDB C driver
 - **Auth/crypto**: OpenSSL (TLS / EVP / RAND), mbedTLS, libsodium (`crypto_pwhash` → argon2; AEAD primitives), Argon2 / bcrypt / scrypt reference impls, JWT C libs
 - **Secrets**: `getenv` / `secure_getenv` / `getenv_s` with secret-shaped names
+- **Dependencies** (`native_deps.py`, mirrored verbatim in attackmap-analyzer-cpp): vcpkg, Conan and CMake manifests → `DependencyHint` (`vcpkg`/`conan`/`cmake`), unpinned CMake downloads → `SupplyChainIssue` `mutable_vcs_dependency` (AttackMap#191). Manifests are parsed as text; `conanfile.py` is never executed.
 
 ## Out of scope (for now)
 - libmicrohttpd per-route extraction — single-callback routing dispatches on `url` inside the handler; we'd need to regex out `if (strcmp(url, "/x") == 0)` patterns to recover paths.

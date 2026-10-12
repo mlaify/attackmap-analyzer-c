@@ -146,7 +146,7 @@ def test_cpm_forms() -> None:
         "CPMAddPackage(NAME cxxopts GITHUB_REPOSITORY jarro2783/cxxopts VERSION 3.1.1)\n"
     )
     deps, issues = _cmake(text)
-    assert deps == [("fmt", "10.1.1", False), ("Catch2", "3.4.0", True), ("cmake-sbom", "v1.5.0", False), ("cxxopts", "v3.1.1", False)]
+    assert deps == [("fmt", "10.1.1", False), ("Catch2", "3.4.0", True), ("cmake-sbom", "v1.5.0", False), ("cxxopts", "3.1.1", False)]
     assert [s for _, s in issues] == ["low", "low", "low", "low"]
 
 
@@ -201,6 +201,73 @@ def test_fuzz_never_raises() -> None:
             except (ValueError, TypeError, KeyError, AttributeError):
                 pass  # native_dependencies() skips malformed JSON
     parse_cmake("FetchContent_Declare(" + "(" * 50000, "CMakeLists.txt")
+
+
+# ---------- review follow-ups ----------
+
+
+def test_deeply_nested_json_does_not_crash(tmp_path: Path) -> None:
+    for name in ("vcpkg.json", "conan.lock"):
+        (tmp_path / name).write_text("[" * 200000 + "]" * 200000, encoding="utf-8")
+    assert native_dependencies(tmp_path, set()) == ([], [])
+
+
+def test_non_list_dependencies_are_ignored() -> None:
+    assert parse_vcpkg_json('{"dependencies": "zlib", "overrides": "x"}', "vcpkg.json") == []
+
+
+def test_conanfile_py_ignores_comments_and_docstrings_and_never_runs(tmp_path: Path) -> None:
+    marker = tmp_path / "executed"
+    text = (
+        f"open({str(marker)!r}, 'w').write('ran')\n"
+        "raise SystemExit(1)\n"
+        '"""Module docstring: requires = "doc/1.0"."""\n'
+        "class App:\n"
+        '    """self.requires("docstring/2.0")"""\n'
+        '    # requires = "commented/3.0"\n'
+        '    requires = "real/4.0"\n'
+    )
+    assert _deps(parse_conanfile_py(text, "conanfile.py")) == [("real", "4.0", False)]
+    assert not marker.exists()
+    assert parse_conanfile_py("def broken(:\n", "conanfile.py") == []
+
+
+def test_conan_1x_lock() -> None:
+    text = (
+        '{"graph_lock": {"nodes": {"0": {"path": "conanfile.txt"},'
+        ' "1": {"ref": "zlib/1.2.13#e377bee636333ae348d51ca90874e353", "context": "host"},'
+        ' "2": {"ref": "cmake/3.25.1", "context": "build"}}}, "version": "0.4"}'
+    )
+    hints = parse_conan_lock(text, "conan.lock")
+    assert _deps(hints) == [("zlib", "1.2.13", False), ("cmake", "3.25.1", True)]
+    assert all(h.resolved for h in hints)
+
+
+def test_find_package_version_ranges() -> None:
+    deps, _ = _cmake("find_package(Foo 1.2...<2.0 REQUIRED)\nfind_package(Bar 3.0...3.5)\n")
+    assert deps == [("Foo", ">=1.2,<2.0", False), ("Bar", ">=3.0,<=3.5", False)]
+
+
+def test_bracket_arguments_are_ignored() -> None:
+    text = "message([[find_package(InBracket 1.0)]])\nset(x [==[ FetchContent_Declare(y GIT_REPOSITORY u) ]==])\nfind_package(Real 2.0)\n"
+    assert _cmake(text) == ([("Real", ">=2.0", False)], [])
+
+
+def test_cmake_scans_are_linear() -> None:
+    import time
+
+    cases = [
+        '"' * 100000,
+        "#[[" * 50000,
+        "[[" * 50000,
+        "find_package(" * 50000,
+        'message("x") ' * 50000,
+        "FetchContent_Declare(a GIT_REPOSITORY u GIT_TAG main)\n" * 5000,
+    ]
+    start = time.perf_counter()
+    for text in cases:
+        parse_cmake(text, "CMakeLists.txt")
+    assert time.perf_counter() - start < 5
 
 
 # ---------- analyzer integration ----------

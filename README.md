@@ -60,10 +60,10 @@ In a mixed repo, `.c` files go to C, and `.cpp`/`.hpp`/... plus `.h` go to C++. 
 |---|---|---|---|
 | `vcpkg.json` `dependencies` | `vcpkg` | `overrides` pin (`resolved=True`), else `>=` from `version>=`, else empty (the `builtin-baseline` decides; it's recorded in the evidence) | `"host": true` |
 | `conanfile.txt` `[requires]` / `[tool_requires]` / `[build_requires]` / `[test_requires]` | `conan` | as written (`1.2.13`, `[>=1.80 <2.0]`) | tool/build/test sections |
-| `conanfile.py` `requires = ...`, `self.requires("x/1.0")` and the tool/build/test forms (read as text, never executed) | `conan` | as written | tool/build/test |
-| `conan.lock` | `conan` | exact (`resolved=True`) | `build_requires` |
+| `conanfile.py` `requires = ...`, `self.requires("x/1.0")` and the tool/build/test forms (parsed with `ast`, never executed; comments and docstrings don't count) | `conan` | as written | tool/build/test |
+| `conan.lock` (Conan 2 lists and Conan 1.x `graph_lock.nodes`) | `conan` | exact (`resolved=True`) | `build_requires`, build-context nodes |
 | CMake `FetchContent_Declare` / `ExternalProject_Add` / `CPMAddPackage` | `cmake` | `GIT_TAG`, a CPM version, or a version in the archive URL | test/example manifests, test frameworks |
-| CMake `find_package(Name [version] [EXACT])` | `cmake` | `>=version` / `==version` | test/example manifests, test frameworks |
+| CMake `find_package(Name [version] [EXACT])` | `cmake` | `>=version` / `==version`, ranges `1.2...<2.0` → `>=1.2,<2.0` | test/example manifests, test frameworks |
 
 `cmake` is inventory-only in core: it has no OSV database, so `--cve` reports those dependencies as not CVE-checked. `conan` and `vcpkg` map to OSV ConanCenter and vcpkg. Build tools and CMake modules (`Threads`, `PkgConfig`, `Python3`, `Git`...) aren't dependencies.
 
@@ -76,7 +76,7 @@ In a mixed repo, `.c` files go to C, and `.cpp`/`.hpp`/... plus `.h` go to C++. 
 | a full 40-hex commit SHA | not flagged |
 | `URL` download without `URL_HASH`/`URL_MD5` | medium |
 
-Values that are CMake variables (`${X}`) are never flagged.
+Values that are CMake variables (`${X}`) are never flagged. Comments, quoted strings and bracket arguments (`[[ ]]`) never contain commands. Malformed or deeply nested manifests are skipped.
 
 ## Coverage notes
 

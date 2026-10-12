@@ -28,6 +28,7 @@ dedupes identical records.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path, PurePosixPath
@@ -44,12 +45,11 @@ _MANIFEST_NAMES = {"CMakeLists.txt", "vcpkg.json", "conanfile.txt", "conanfile.p
 _MAX_ARGS_SPAN = 8000
 _MAX_FILE_CHARS = 2_000_000
 
-_CMAKE_BRACKET_COMMENT_RE = re.compile(r"#\[(=*)\[[\s\S]*?\]\1\]")
-_CMAKE_LINE_COMMENT_RE = re.compile(r"#[^\n]*")
+_CMAKE_QUOTED_BODY_RE = re.compile(r"(?:[^\"\\]|\\[\s\S])*")
+_PAREN_RE = re.compile(r"[()]")
 _CMAKE_COMMAND_RE = re.compile(
     r"\b(FetchContent_Declare|ExternalProject_Add|CPMAddPackage|CPMFindPackage|find_package)\s*\(", re.IGNORECASE
 )
-_CMAKE_STRING_RE = re.compile(r"\"(?:[^\"\\]|\\[\s\S])*\"")
 _CMAKE_TOKEN_RE = re.compile(r"\"((?:[^\"\\]|\\[\s\S])*)\"|([^\s\"()]+)")
 _SHA40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]{7,39}$")
@@ -58,6 +58,8 @@ _URL_VERSION_RE = re.compile(r"(?:^|[/_-])v?(\d+(?:[._]\d+){1,3})(?=[^/]*$|/)")
 _URL_BRANCH_RE = re.compile(r"/(?:archive|zip|tarball|zipball)/(?:refs/heads/)?(?:main|master|develop|trunk|HEAD)\b"
                             r"|/refs/heads/|/(?:main|master)\.(?:zip|tar\.gz|tgz)$", re.IGNORECASE)
 _VERSION_TOKEN_RE = re.compile(r"^\d+(?:\.\d+){0,3}$")
+# CMake >= 3.19 version range: `1.2...2.0` (inclusive) / `1.2...<2.0`.
+_VERSION_RANGE_RE = re.compile(r"^(\d+(?:\.\d+){0,3})\.\.\.(<?)(\d+(?:\.\d+){0,3})$")
 _CPM_SHORTHAND_RE = re.compile(r"^(?:(gh|gl|bb):)?([^@#\s]+?)(?:@([^#\s]+))?(?:#(\S+))?$")
 # CMake modules and build tools found with find_package that aren't
 # third-party code shipped with the project.
@@ -75,9 +77,7 @@ _TEST_SEGMENTS = frozenset({"test", "tests", "testing", "unittest", "unittests",
 _CONAN_REF_RE = re.compile(r"\b([A-Za-z0-9_][A-Za-z0-9_.+-]{0,100})/(\[[^\]\n]{1,80}\]|[A-Za-z0-9_.+~-]{1,64})"
                            r"(?:@[\w.+-]{1,64}/[\w.+-]{1,64})?(?:#[0-9a-f]{1,64})?")
 _CONAN_SECTION_RE = re.compile(r"^\s*\[([a-z_]+)\]\s*$", re.MULTILINE)
-_CONAN_PY_ATTR_RE = re.compile(r"^\s*(requires|tool_requires|build_requires|test_requires)\s*=\s*", re.MULTILINE)
-_CONAN_PY_CALL_RE = re.compile(r"\bself\.(requires|tool_requires|build_requires|test_requires)\s*\(\s*[\"']")
-_PY_STRING_RE = re.compile(r"[\"']([^\"'\n]{1,200})[\"']")
+_CONAN_REQUIRE_NAMES = frozenset({"requires", "tool_requires", "build_requires", "test_requires"})
 _DEV_SECTIONS = frozenset({"tool_requires", "build_requires", "test_requires"})
 
 
@@ -107,8 +107,8 @@ def manifest_records(path: Path, text: str, relative: str) -> tuple[list, list]:
             return parse_conan_lock(text, relative), []
         if name == "CMakeLists.txt" or path.suffix == ".cmake":
             return parse_cmake(text, relative)
-    except (ValueError, TypeError, KeyError, AttributeError):
-        pass
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError, MemoryError):
+        pass  # malformed or hostile (deeply nested JSON, unparsable Python)
     return [], []
 
 
@@ -149,20 +149,25 @@ def _line(text: str, needle: str) -> int | None:
 # ---------- vcpkg ----------
 
 
+def _list(value: object) -> list:
+    """A JSON list field, or nothing (`"dependencies": "zlib"` is malformed)."""
+    return value if isinstance(value, list) else []
+
+
 def parse_vcpkg_json(text: str, relative: str) -> list:
     data = json.loads(text)
     if not isinstance(data, dict):
         return []
     baseline = data.get("builtin-baseline")
     overrides = {}
-    for item in data.get("overrides") or []:
+    for item in _list(data.get("overrides")):
         if isinstance(item, dict) and isinstance(item.get("name"), str):
             version = item.get("version") or item.get("version-string") or item.get("version-semver") or item.get("version-date")
             if isinstance(version, str):
                 overrides[item["name"]] = version
     dev_manifest = _is_test_manifest(relative)
     out = []
-    for item in data.get("dependencies") or []:
+    for item in _list(data.get("dependencies")):
         if isinstance(item, str):
             name, minimum, host = item, None, False
         elif isinstance(item, dict) and isinstance(item.get("name"), str):
@@ -214,90 +219,156 @@ def parse_conanfile_txt(text: str, relative: str) -> list:
 
 
 def parse_conanfile_py(text: str, relative: str) -> list:
-    out = []
+    """Requirements from a ``conanfile.py``, read with ``ast`` and never run:
+    ``requires = "a/1.0"`` / a tuple or list (class or module level), and
+    ``self.requires("x/1.0")`` and the tool/build/test forms. Comments and
+    docstrings are not code, so they don't count."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return []
     dev_manifest = _is_test_manifest(relative)
-    for match in _CONAN_PY_ATTR_RE.finditer(text):
-        # `requires = "a/1.0", "b/2.0"` or a list/tuple, possibly over lines.
-        end = match.end()
-        depth = 0
-        stop = min(len(text), end + 2000)
-        i = end
-        while i < stop:
-            c = text[i]
-            if c in "([{":
-                depth += 1
-            elif c in ")]}":
-                depth -= 1
-            elif c == "\n" and depth <= 0 and text[end:i].strip():
-                break
-            i += 1
-        for literal in _PY_STRING_RE.finditer(text, end, i):
-            ref = _CONAN_REF_RE.fullmatch(literal.group(1))
+    out = []
+
+    def literal_refs(node: ast.AST) -> list[ast.Constant]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node]
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return [e for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        return []
+
+    def emit(kind: str, constants: list[ast.Constant]) -> None:
+        for constant in constants:
+            ref = _CONAN_REF_RE.fullmatch(constant.value)
             if ref is not None:
-                out.append(_conan_hint(ref, text, relative, match.group(1) in _DEV_SECTIONS or dev_manifest, literal.start()))
-    for match in _CONAN_PY_CALL_RE.finditer(text):
-        literal = _PY_STRING_RE.match(text, match.end() - 1)
-        if literal is not None:
-            ref = _CONAN_REF_RE.fullmatch(literal.group(1))
-            if ref is not None:
-                out.append(_conan_hint(ref, text, relative, match.group(1) in _DEV_SECTIONS or dev_manifest, match.start()))
+                offset = _offset_of(text, constant.lineno, constant.col_offset)
+                out.append(_conan_hint(ref, text, relative, kind in _DEV_SECTIONS or dev_manifest, offset))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if node.targets[0].id in _CONAN_REQUIRE_NAMES:
+                emit(node.targets[0].id, literal_refs(node.value))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr in _CONAN_REQUIRE_NAMES
+            and node.args
+        ):
+            emit(node.func.attr, literal_refs(node.args[0]))
+    out.sort(key=lambda d: d.line or 0)
     return out
 
 
+def _offset_of(text: str, lineno: int, col: int) -> int:
+    offset = 0
+    for _ in range(lineno - 1):
+        newline = text.find("\n", offset)
+        if newline == -1:
+            return offset
+        offset = newline + 1
+    return offset + col
+
+
 def parse_conan_lock(text: str, relative: str) -> list:
+    """Conan 2 (``requires`` / ``build_requires`` lists) and Conan 1.x
+    (``graph_lock.nodes``, build-context nodes are ``dev``) lockfiles."""
     data = json.loads(text)
     if not isinstance(data, dict):
         return []
-    out = []
+    entries: list[tuple[str, bool]] = []
     for key, dev in (("requires", False), ("build_requires", True), ("python_requires", True)):
-        for entry in data.get(key) or []:
-            if not isinstance(entry, str):
-                continue
-            ref = _CONAN_REF_RE.match(entry)
-            if ref is not None:
-                out.append(_conan_hint(ref, text, relative, dev, max(0, text.find(entry)), resolved=True))
+        entries.extend((entry, dev) for entry in _list(data.get(key)) if isinstance(entry, str))
+    graph = data.get("graph_lock")
+    nodes = graph.get("nodes") if isinstance(graph, dict) else None
+    if isinstance(nodes, dict):
+        for node in nodes.values():
+            if isinstance(node, dict) and isinstance(node.get("ref"), str):
+                entries.append((node["ref"], node.get("context") == "build"))
+    out = []
+    for entry, dev in entries:
+        ref = _CONAN_REF_RE.match(entry)
+        if ref is not None:
+            out.append(_conan_hint(ref, text, relative, dev, max(0, text.find(entry)), resolved=True))
     return out
 
 
 # ---------- CMake ----------
 
 
-def _strip_cmake_comments(text: str) -> str:
-    text = _CMAKE_BRACKET_COMMENT_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
-    out = []
-    for line in text.split("\n"):
-        hash_at = _unquoted_hash(line)
-        out.append(line if hash_at < 0 else line[:hash_at] + " " * (len(line) - hash_at))
-    return "\n".join(out)
+_CMAKE_SPECIAL_RE = re.compile(r"#\[(=*)\[|#|\"|\[(=*)\[")
 
 
-def _unquoted_hash(line: str) -> int:
-    quoted = False
-    escaped = False
-    for i, c in enumerate(line):
-        if escaped:
-            escaped = False
-        elif c == "\\":
-            escaped = True
-        elif c == '"':
-            quoted = not quoted
-        elif c == "#" and not quoted:
-            return i
-    return -1
+def _cmake_masks(text: str) -> tuple[str, str]:
+    """``(clean, bare)`` in one linear pass. ``clean``: comments (``#`` and
+    ``#[[ ]]``) and bracket arguments (``[[ ]]``, whose content is never a
+    command or a dependency) blanked, quoted strings kept for argument
+    values. ``bare``: quoted string contents blanked too, so a command inside
+    ``message("find_package(x)")`` doesn't count. Unterminated constructs
+    run to the end of the file."""
+    clean: list[str] = []
+    bare: list[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        match = _CMAKE_SPECIAL_RE.search(text, pos)
+        if match is None:
+            break
+        start = match.start()
+        clean.append(text[pos:start])
+        bare.append(text[pos:start])
+        token = match.group(0)
+        if token.startswith("#[") or (token.startswith("[") and match.group(2) is not None):
+            equals = match.group(1) if token.startswith("#") else match.group(2)
+            close = text.find("]" + equals + "]", match.end())
+            end = n if close == -1 else close + len(equals) + 2
+            blank = _blank(text[start:end])
+            clean.append(blank)
+            bare.append(blank)
+        elif token == "#":
+            newline = text.find("\n", start)
+            end = n if newline == -1 else newline
+            blank = _blank(text[start:end])
+            clean.append(blank)
+            bare.append(blank)
+        else:  # quoted argument
+            body = _CMAKE_QUOTED_BODY_RE.match(text, match.end())
+            end = body.end() if body else match.end()
+            if end < n:
+                end += 1  # closing quote
+            clean.append(text[start:end])
+            closed = end - start >= 2 and text[end - 1] == '"'
+            inner_end = end - 1 if closed else end
+            bare.append('"' + _blank(text[start + 1 : inner_end]) + ('"' if closed else ""))
+        pos = end
+    clean.append(text[pos:])
+    bare.append(text[pos:])
+    return "".join(clean), "".join(bare)
 
 
-def _cmake_args(text: str, open_paren: int) -> list[str] | None:
-    depth = 0
-    for i in range(open_paren, min(len(text), open_paren + _MAX_ARGS_SPAN)):
-        c = text[i]
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth == 0:
-                body = text[open_paren + 1 : i]
-                return [m.group(1) if m.group(1) is not None else m.group(2) for m in _CMAKE_TOKEN_RE.finditer(body)]
-    return None
+def _blank(text: str) -> str:
+    return re.sub(r"[^\n]", " ", text)
+
+
+def _paren_pairs(bare: str) -> dict[int, int]:
+    """Matching ``)`` for every ``(`` in one pass (strings already blanked)."""
+    pairs: dict[int, int] = {}
+    stack: list[int] = []
+    for match in _PAREN_RE.finditer(bare):
+        if match.group(0) == "(":
+            stack.append(match.start())
+        elif stack:
+            pairs[stack.pop()] = match.start()
+    return pairs
+
+
+def _cmake_args(clean: str, open_paren: int, pairs: dict[int, int]) -> list[str] | None:
+    close = pairs.get(open_paren)
+    if close is None or close - open_paren > _MAX_ARGS_SPAN:
+        return None
+    body = clean[open_paren + 1 : close]
+    return [m.group(1) if m.group(1) is not None else m.group(2) for m in _CMAKE_TOKEN_RE.finditer(body)]
 
 
 def _keyword_values(args: list[str]) -> dict[str, str]:
@@ -343,15 +414,14 @@ def _url_version(url: str) -> str:
 
 
 def parse_cmake(text: str, relative: str) -> tuple[list, list]:
-    clean = _strip_cmake_comments(text)
+    clean, bare = _cmake_masks(text)
+    pairs = _paren_pairs(bare)
     deps: list = []
     issues: list = []
     dev_manifest = _is_test_manifest(relative)
-    # Commands inside quoted strings (`message("find_package(x)")`) don't count.
-    unquoted = _CMAKE_STRING_RE.sub(lambda m: '"' + re.sub(r"[^\n]", " ", m.group(0)[1:-1]) + '"', clean)
-    for match in _CMAKE_COMMAND_RE.finditer(unquoted):
+    for match in _CMAKE_COMMAND_RE.finditer(bare):
         command = match.group(1).lower()
-        args = _cmake_args(clean, match.end() - 1)
+        args = _cmake_args(clean, match.end() - 1, pairs)
         if not args:
             continue
         line = line_of(text, match.start())
@@ -378,6 +448,9 @@ def _find_package(args: list[str], relative: str, line: int, dev_manifest: bool)
     version = ""
     if len(args) > 1 and _VERSION_TOKEN_RE.match(args[1]):
         version = ("==" if "EXACT" in args[2:] else ">=") + args[1]
+    elif len(args) > 1 and (version_range := _VERSION_RANGE_RE.match(args[1])):
+        low, exclusive, high = version_range.groups()
+        version = f">={low},{'<' if exclusive else '<='}{high}"
     return DependencyHint(
         name=name, version=version, ecosystem="cmake", file=relative, line=line,
         dev=dev_manifest or name.lower() in _TEST_DEPS, evidence_text=f"find_package({' '.join(args[:4])})",
@@ -401,7 +474,8 @@ def _download(command: str, args: list[str], relative: str, line: int, dev_manif
         ref = "v" + values["VERSION"]  # CPM's default tag for a VERSION
     dev = dev_manifest or name.lower() in _TEST_DEPS
     if repo is not None:
-        version = ref if ref and "${" not in ref else ""
+        version = values.get("VERSION") if cpm and "VERSION" in values else ref
+        version = version if version and "${" not in version else ""
         dep = DependencyHint(name=name, version=version, ecosystem="cmake", file=relative, line=line, dev=dev,
                              evidence_text=repo)
         return dep, _ref_issue(name, ref, repo, relative, line)

@@ -67,11 +67,11 @@ The analyzer emits function-local C weaknesses as `CodeWeakness` records (mlaify
 
 | Kind (rule id) | Fires on | Not reported |
 |---|---|---|
-| `unbounded_copy` (CWE-120) | `gets`; `scanf`/`fscanf` `%s`/`%[` without a width; `strcpy`/`strcat`/`sprintf` `%s` whose source is traced to an input | a literal or untraced source; a source checked with `strlen(s) < ...` or a length alias first; a sized destination (`malloc(strlen(s) + 1)`); `%.Ns`; a bounded read (`fgets`, `recv`, `%255s`) copied into an array at least as large |
+| `unbounded_copy` (CWE-120) | `gets`; `scanf`/`fscanf` `%s`/`%[` without a width; `strcpy`/`strcat`/`sprintf` `%s` whose source is traced to an input | a literal or untraced source; a source with an upper-bound check first (`strlen(s) < sizeof dst`, directly or through a length alias; `> 0` / `< 0` checks don't count); a sized destination (`malloc(strlen(s) + 1)`); `%.Ns`; a bounded read (`fgets`, `recv`, `%255s`) copied into an array at least as large |
 | `format_string` (CWE-134) | a printf-family format (`printf`, `fprintf`, `sprintf`, `snprintf`, `syslog`, civetweb/mongoose `mg_printf`, `mg_http_reply`) that is not a constant | literals, `#define` and `static const` strings, literal ternaries, gettext `_()`, variadic and `va_list` wrappers forwarding their own `fmt`, untraced function results |
 | `native_command_exec` (CWE-78) | `system`/`popen` with a non-constant command; `exec*` with an input-derived argument or a non-constant `sh -c` line | constant commands, `NULL`, an untraced `execv(path, args)` without a shell |
-| `tainted_copy_length` (CWE-805) | `memcpy`/`memmove`/`strncpy`/`strncat` length traced to an input | lengths compared or clamped (`MIN`, `assert`) first, a destination allocated from the same length, a byte count returned by `recv`/`read` |
-| `alloc_size_overflow` (CWE-680) | `malloc`/`realloc`/`alloca` of a product with an input-derived factor | `calloc`, sums, untraced factors, a factor checked first or a `SIZE_MAX`/`__builtin_mul_overflow` guard |
+| `tainted_copy_length` (CWE-805) | `memcpy`/`memmove`/`strncpy`/`strncat` length traced to an input | lengths with an upper-bound check (`n > sizeof dst`, `ck_assert_int_lt(n, cap)`) or a clamp (`MIN`, `n > cap ? cap : n`, also inside the call) first, a destination allocated from the same length, a byte count returned by `recv`/`read` |
+| `alloc_size_overflow` (CWE-680) | `malloc`/`realloc`/`alloca` of a product with an input-derived factor | `calloc`, sums, untraced factors, a factor with an upper-bound check first or a `SIZE_MAX`/`__builtin_mul_overflow` guard |
 
 **Sources**, traced per function through assignments, out-parameters and copy functions:
 
@@ -79,7 +79,7 @@ The analyzer emits function-local C weaknesses as `CodeWeakness` records (mlaify
 - **Network input:** `recv`/`recvfrom`/`SSL_read`/`BIO_read`/`mbedtls_ssl_read`, and `read` on a socket-named descriptor.
 - **Local input:** stdin (`fgets(..., stdin)`, `scanf`), `argv`/`optarg` in a function that takes `argv`, `getenv`, and file reads.
 
-Taint doesn't flow through calls to unknown functions (`gethostbyname(argv[1])`).
+Taint doesn't flow through calls to unknown functions (`gethostbyname(argv[1])`). A reassignment to a literal (`u = "default"`) clears it. A copy between two declared arrays where the destination is at least as large isn't reported.
 
 **Severity and confidence:**
 

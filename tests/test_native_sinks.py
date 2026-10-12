@@ -230,6 +230,27 @@ def test_taint_does_not_flow_through_unknown_calls() -> None:
     assert _kinds(code) == []
 
 
+def test_clamp_inside_the_call_is_a_bound() -> None:
+    assert _kinds(NET + "    memcpy(out, pkt + 2, len > sizeof out ? sizeof out : len);\n}\n") == []
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        "    if (len < 0) return;",  # a sign check is not an upper bound
+        "    if (len == 0) return;",
+        "    if (strlen((char *)pkt) > 0) puts(\"x\");",
+        "    assert(len != 0);",
+    ],
+)
+def test_non_bounding_checks_do_not_silence(check: str) -> None:
+    assert _kinds(NET + check + "\n    memcpy(out, pkt + 2, len);\n}\n") == ["tainted_copy_length"]
+
+
+def test_upper_bound_assert_call_is_a_bound() -> None:
+    assert _kinds(NET + "    ck_assert_int_lt(len, sizeof(out));\n    memcpy(out, pkt + 2, len);\n}\n") == []
+
+
 # ---------- alloc_size_overflow ----------
 
 
@@ -254,6 +275,37 @@ def test_alloc_negatives(tail: str) -> None:
 
 
 # ---------- sources ----------
+
+
+def test_reassignment_to_a_literal_clears_taint() -> None:
+    code = (
+        "int main(int argc, char **argv) {\n    const char *u = argv[1];\n"
+        '    if (bad(u)) u = "default";\n    char b[8];\n    strcpy(b, u);\n    system(u);\n}\n'
+    )
+    # The input no longer reaches either call; `system(u)` is still a
+    # non-constant command (low, untraced).
+    assert _hits(code) == [(6, "native_command_exec", "low", None)]
+
+
+def test_copy_into_an_array_at_least_as_large_cannot_overflow() -> None:
+    code = (
+        "void f(int sock) {\n    char pkt[64], out[64], small[8];\n    recv(sock, pkt, sizeof pkt, 0);\n"
+        "    strcpy(out, pkt);\n    strcpy(small, pkt);\n}\n"
+    )
+    assert _hits(code) == [(5, "unbounded_copy", "high", "network")]
+
+
+def test_unbounded_input_held_in_a_smaller_array_cannot_overflow_a_larger_one() -> None:
+    code = "void f(void) {\n    char line[32], out[64], tiny[8];\n    gets(line);\n    strcpy(out, line);\n    strcpy(tiny, line);\n}\n"
+    assert _hits(code) == [(3, "unbounded_copy", "medium", "stdin"), (5, "unbounded_copy", "medium", "stdin")]
+
+
+def test_struct_request_is_not_a_web_request() -> None:
+    code = "void handle(struct Request *r) {\n    char b[8];\n    strcpy(b, r->path);\n    system(r->cmd);\n}\n"
+    assert _hits(code) == [(4, "native_command_exec", "low", None)]
+
+
+
 
 
 def test_libmicrohttpd_handler_params_are_request_input() -> None:
@@ -415,6 +467,33 @@ def test_pathological_input_is_fast() -> None:
     for text in cases:
         find_native_weaknesses(text, "src/x.c")
     assert time.perf_counter() - start < 10
+
+
+def _timed(text: str, path: str = "src/x.cpp") -> float:
+    start = time.perf_counter()
+    find_native_weaknesses(text, path)
+    return time.perf_counter() - start
+
+
+def test_large_function_with_many_sinks_is_linear() -> None:
+    def fn(n: int) -> str:
+        lines = [f"    unsigned short n{i} = ntohs(pkt[{i}]); if (n{i} > sizeof out) return; memcpy(out, pkt, n{i});" for i in range(n)]
+        return "void f(int sock) {\n    char out[64]; unsigned short pkt[512]; recv(sock, pkt, sizeof pkt, 0);\n" + "\n".join(lines) + "\n}\n"
+    small, large = _timed(fn(500)), _timed(fn(2000))
+    assert large < 3
+    assert large < small * 8 + 0.5  # ~4x the input, not ~16x
+
+
+def test_unterminated_constructs_are_linear() -> None:
+    assert _timed("#if 0\nint x;\n" * 5000) < 2
+    assert _timed('R"abc(' * 20000) < 2
+    assert _timed("/*" * 50000) < 2
+    assert _timed('"' + "\\" * 50000) < 2
+
+
+def test_nested_lambdas_are_not_rescanned() -> None:
+    text = "void f() {" + "auto l = [&](const httplib::Request &req) { memcpy(a, b, req.body.size());" * 500 + "}" * 1000
+    assert _timed(text) < 3
 
 
 # ---------- analyzer integration ----------

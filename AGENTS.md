@@ -43,7 +43,8 @@ This analyzer is marked `experimental=True` on its metadata because:
 - Keyword sweeps (`Authorization`, `Bearer`, `api_key`) → 0.6
 
 ## Native sinks (`native_sinks.py`)
-- Function-local: a sink is judged only against sources traced in its enclosing function or lambda, in textual order. Taint is never cleared. It doesn't flow through unknown free-function calls.
+- Function-local: a sink is judged only against sources traced in its enclosing function or lambda, in textual order. A reassignment to a literal clears taint. It doesn't flow through unknown free-function calls. Only upper-bound checks against a non-trivial bound count as guards (`n < 0`, `strlen(s) > 0` don't).
+- Linear work: one masking pass, one pass per pattern over the file with each match filed under its innermost function/lambda, and precomputed per-function bound/clamp indices. `test_*_linear` / `test_nested_lambdas_are_not_rescanned` guard it.
 - Precision over recall. An untraced `strcpy`/`memcpy`/`malloc` is never reported. Only a non-constant format or command is reported without a traced source, and then at low.
 - Severity/confidence: request or network input → high/high, local input (stdin, argv, env, file) → medium/medium, untraced → low/low. Example/demo/contrib paths are capped at low. Test/fuzz/bench paths are skipped unless `ATTACKMAP_INCLUDE_TESTS` is set.
 - The module is **mirrored verbatim** in attackmap-analyzer-cpp, together with `tests/test_native_sinks.py` (the C++ copy adds C++ framework cases). Change both together.

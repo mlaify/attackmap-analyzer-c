@@ -60,46 +60,103 @@ _MAX_PARAMS_SPAN = 2000
 _MAX_RHS_SPAN = 1500
 _COMPARE_WINDOW = 120
 _MAX_OWNER_WALK = 2000
+_MAX_INHERIT_DEPTH = 8
 
 # ---------- Masking ----------
 
-# One pass over the source: comments, preprocessor directives (with
-# continuation lines), ``#if 0`` blocks and string/char literals. Comments and
-# directives become spaces; literals keep their quotes and lose their
-# contents. Newlines are preserved so offsets and line numbers don't move.
-_MASK_RE = re.compile(
-    r"^[ \t]*\#[ \t]*if[ \t]+0\b[\s\S]*?^[ \t]*\#[ \t]*(?:endif|else|elif)\b[^\n]*"
-    r"|^[ \t]*\#(?:[^\n\\]|\\[\s\S])*"
-    r"|//[^\n]*"
-    r"|/\*[\s\S]*?(?:\*/|\Z)"
-    r"|(?<![\w])(?:u8|[uUL])?R\"(?P<delim>[^()\\\s\"]{0,16})\((?:[^)]|\)(?!(?P=delim)\"))*\)(?P=delim)\""
-    r"|\"(?:[^\"\\\n]|\\[\s\S])*\"?"
-    r"|'(?:[^'\\\n]|\\[\s\S]){0,8}'",
+# One left-to-right pass over the source: comments, preprocessor directives
+# (with continuation lines), ``#if 0`` blocks and string/char/raw-string
+# literals. Comments and directives become spaces; literals keep their quotes
+# and lose their contents. Newlines are preserved so offsets and line numbers
+# don't move. Each construct is consumed up to its terminator, or to the end of
+# the file when it has none, so the scan is linear even on unterminated input.
+_MASK_START_RE = re.compile(
+    r"(?P<if0>^[ \t]*\#[ \t]*if[ \t]+0\b)"
+    r"|(?P<pp>^[ \t]*\#)"
+    r"|(?P<line>//)"
+    r"|(?P<block>/\*)"
+    r"|(?P<raw>(?<![\w])(?:u8|[uUL])?R\"(?P<delim>[^()\\\s\"]{0,16})\()"
+    r"|(?P<str>(?<![\w])(?:u8|[uUL])?\"|\")"
+    r"|(?P<chr>')",
     re.MULTILINE,
 )
+_IF0_END_RE = re.compile(r"^[ \t]*\#[ \t]*(?:endif|else|elif)\b[^\n]*", re.MULTILINE)
+_STRING_BODY_RE = re.compile(r"(?:[^\"\\\n]|\\[\s\S])*")
+_CHAR_BODY_RE = re.compile(r"(?:[^'\\\n]|\\[\s\S]){0,8}'")
 
 
 def _blank(text: str) -> str:
     return re.sub(r"[^\n]", " ", text)
 
 
-def _mask_match(match: re.Match[str]) -> str:
-    text = match.group(0)
-    if text.startswith(("#", "/", " ", "\t")):
-        return _blank(text)
-    quote = 0 if text.startswith("'") else text.find('"')
-    if quote < 0:
-        return _blank(text)
-    head, body = text[: quote + 1], text[quote + 1 :]
-    if len(body) >= 1 and body[-1] in "\"'":
-        return head + _blank(body[:-1]) + body[-1]
-    return head + _blank(body)
-
-
 def mask_source(text: str) -> str:
     """Same-length copy of ``text`` with comments, directives and literal
     contents blanked (quotes kept, newlines kept)."""
-    return _MASK_RE.sub(_mask_match, text)
+    out: list[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        match = _MASK_START_RE.search(text, pos)
+        if match is None:
+            break
+        start = match.start()
+        out.append(text[pos:start])
+        kind = match.lastgroup if match.lastgroup != "delim" else "raw"
+        if match.group("raw") is not None:
+            kind = "raw"
+        if kind == "if0":
+            end_match = _IF0_END_RE.search(text, match.end())
+            end = end_match.end() if end_match else n
+            out.append(_blank(text[start:end]))
+        elif kind == "pp":
+            end = match.end()
+            while True:
+                newline = text.find("\n", end)
+                if newline == -1:
+                    end = n
+                    break
+                if text[newline - 1] == "\\":
+                    end = newline + 1
+                    continue
+                end = newline
+                break
+            out.append(_blank(text[start:end]))
+        elif kind == "line":
+            newline = text.find("\n", start)
+            end = n if newline == -1 else newline
+            out.append(_blank(text[start:end]))
+        elif kind == "block":
+            close = text.find("*/", match.end())
+            end = n if close == -1 else close + 2
+            out.append(_blank(text[start:end]))
+        elif kind == "raw":
+            terminator = ")" + match.group("delim") + '"'
+            close = text.find(terminator, match.end())
+            if close == -1:
+                out.append(text[start : match.end()] + _blank(text[match.end() :]))
+                end = n
+            else:
+                out.append(text[start : match.end()] + _blank(text[match.end() : close + len(terminator) - 1]) + '"')
+                end = close + len(terminator)
+        elif kind == "str":
+            body = _STRING_BODY_RE.match(text, match.end())
+            body_end = body.end() if body else match.end()
+            out.append(text[start : match.end()] + _blank(text[match.end() : body_end]))
+            end = body_end
+            if end < n and text[end] == '"':
+                out.append('"')
+                end += 1
+        else:  # char literal
+            body = _CHAR_BODY_RE.match(text, match.end())
+            if body is None:
+                out.append("'")
+                end = match.end()
+            else:
+                out.append("'" + _blank(text[match.end() : body.end() - 1]) + "'")
+                end = body.end()
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 # ---------- Calls, functions, arguments ----------
@@ -126,6 +183,7 @@ class _Scope:
     params: str  # masked parameter text
     params_orig: str
     param_names: set[str] = field(default_factory=set)
+    parent: int | None = None
 
 
 def _skip_ws_back(text: str, i: int) -> int:
@@ -214,6 +272,13 @@ def _scopes(masked: str, orig: str) -> list[_Scope]:
             )
         )
     scopes.sort(key=lambda s: s.start)
+    # Parent links (the enclosing function of a lambda).
+    stack: list[int] = []
+    for index, scope in enumerate(scopes):
+        while stack and scopes[stack[-1]].end < scope.start:
+            stack.pop()
+        scope.parent = stack[-1] if stack else None
+        stack.append(index)
     return scopes
 
 
@@ -332,20 +397,27 @@ _DIRECT_SOURCES: tuple[tuple[str, re.Pattern[str]], ...] = (
     # cpp-httplib / Crow / Drogon / Pistache / restbed accessors
     ("request", re.compile(r"\.\s*get_(?:param|header|file)_value\s*\(")),
     ("request", re.compile(r"\.\s*url_params\b")),
-    ("request", re.compile(r"->\s*get(?:Parameter|Parameters|Header|Headers|Body|JsonObject|Cookie|Cookies|Path|Query)\s*\(")),
-    ("request", re.compile(r"->\s*get_(?:query|path)_parameters?\s*\(")),
-    ("request", re.compile(r"->\s*get_request\s*\(")),
 )
-# Parameter (or local declaration) types whose variable is request data.
+# Parameter types whose variable is request data. Qualified framework types
+# always count; bare names only in a file that uses that framework (gates).
 _REQUEST_TYPE_RE = re.compile(
-    r"(?:\bstruct\s+(?:mg_http_message|mg_request_info)\b"
-    r"|\b(?:httplib::)?Request\b"
-    r"|\bcrow::request\b"
-    r"|\bHttpRequestPtr\b"
-    r"|\b(?:Pistache::)?(?:Rest|Http)::Request\b"
-    r"|\b(?:\w+::)*request\s*<"
-    r"|\bshared_ptr\s*<\s*(?:const\s+)?(?:restbed::)?(?:Session|Request)\s*>"
-    r")"
+    r"\bhttplib::Request\b|\bcrow::request\b|\b(?:drogon::)?HttpRequestPtr\b|\bdrogon::HttpRequest\b"
+    r"|\bPistache::(?:Rest|Http)::Request\b|\b(?:boost::)?beast::http::request\s*<"
+    r"|\brestbed::(?:Session|Request)\b"
+)
+_MG_REQUEST_TYPE_RE = re.compile(r"\bstruct\s+(?:mg_http_message|mg_request_info)\b")
+_STRUCT_REQUEST_RE = re.compile(r"\bstruct\s+\w+")
+_FRAMEWORK_GATES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("httplib", re.compile(r"\bhttplib\b")),
+    ("pistache", re.compile(r"\b[Pp]istache\b")),
+    ("beast", re.compile(r"\bbeast\b")),
+    ("restbed", re.compile(r"\brestbed\b")),
+)
+_GATED_REQUEST_TYPES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("httplib", re.compile(r"(?<![\w:])Request\b")),
+    ("pistache", re.compile(r"\b(?:Rest|Http)::Request\b")),
+    ("beast", re.compile(r"\b(?:http::)?request\s*<")),
+    ("restbed", re.compile(r"\bshared_ptr\s*<\s*(?:const\s+)?(?:restbed::)?(?:Session|Request)\s*>")),
 )
 _MG_LOCAL_DECL_RE = re.compile(r"\bstruct\s+(?:mg_http_message|mg_request_info)\s*\*\s*(?:const\s+)?([A-Za-z_]\w*)")
 # libmicrohttpd access-handler parameters that carry the request.
@@ -391,7 +463,7 @@ _ASSIGN_RE = re.compile(
 )
 _DECL_STRING_LITERAL_RE = re.compile(
     r"\b(?:const\s+)?(?:char|wchar_t|TCHAR|std::string|string)\s*(?:const\s*)?\*?\s*(?:const\s+)?"
-    r"([A-Za-z_]\w*)\s*(?:\[\s*\w*\s*\])?\s*(?:=\s*\{?|\{)\s*(?:u8|[uUL])?\""
+    r"([A-Za-z_]\w*)\s*(?:\[\s*\w*\s*\])?\s*(?:=\s*\{?|\{)\s*(?:u8|[uUL])?\"[^\"\n]*\"\s*[;,)}]"
 )
 # `char buf[256], small[16];`: declared byte/char arrays with a literal size.
 _ARRAY_DECL_START_RE = re.compile(r"\b(?:char|wchar_t|TCHAR|u?int8_t|BYTE|uchar)\s+(?=[*\s]*[A-Za-z_])")
@@ -426,11 +498,6 @@ _BOUNDED_PROPAGATORS = frozenset(
      "mg_snprintf"}
 )
 _DEFINE_STRING_RE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+(?:u8|[uUL])?\"", re.MULTILINE)
-# assert(), ck_assert_int_lt(), ASSERT(), CHECK(), REQUIRE(), EXPECT_LT()...
-_CHECK_CALL_RE = re.compile(
-    r"\b(?:assert|static_assert|[A-Za-z_]\w*_assert\w*|ck_assert\w*|ASSERT\w*|CHECK\w*|REQUIRE\w*|"
-    r"EXPECT_\w+|BOOST_ASSERT\w*|g_return_\w+)\s*\("
-)
 _COMPARE_OP_RE = re.compile(r"(?<![-<>=!])(?:<=|>=|<|>)(?![<>=])")
 _OVERFLOW_GUARD_RE = re.compile(r"\b(?:SIZE_MAX|INT_MAX|UINT_MAX|LONG_MAX|SSIZE_MAX|PTRDIFF_MAX|__builtin_mul_overflow|"
                                 r"ckd_mul|std::numeric_limits)\b")
@@ -439,6 +506,9 @@ _OVERFLOW_GUARD_RE = re.compile(r"\b(?:SIZE_MAX|INT_MAX|UINT_MAX|LONG_MAX|SSIZE_
 _MUL_RE = re.compile(r"[\w)\]]\s*(?:\*(?![*/=)])|<<(?!=))")
 _GETTEXT_RE = re.compile(r"^\s*(?:_|N_|gettext|dgettext|_T|TEXT|L|tr|QObject::tr)\s*\(")
 _ALL_CAPS_RE = re.compile(r"^\s*[A-Z][A-Z0-9_]*\s*$")
+# Literals only, possibly concatenated with macros (`"%" PRIu64 "\n"`);
+# `"ping " + host` is not constant.
+_LITERAL_ONLY_RE = re.compile(r"^\s*(?:u8|[uUL])?\"[^\"\n]*\"(?:\s*(?:(?:u8|[uUL])?\"[^\"\n]*\"|[A-Za-z_]\w*))*\s*$")
 _LITERAL_START_RE = re.compile(r"^\s*(?:u8|[uUL])?\"")
 _CONVERSION_RE = re.compile(
     r"%(?:%|(?P<flags>[-+ #0']*)(?P<width>\*|\d+)?(?:\.(?P<prec>\*|\d+))?"
@@ -454,6 +524,10 @@ _ALL_CALLS = sorted(
     set(_UNBOUNDED_COPY) | set(_FORMAT_FUNCS) | set(_SCANF) | set(_SHELL_COMMAND) | _EXEC
     | set(_LENGTH_COPY) | set(_ALLOC) | set(_OUT_PARAM_SOURCES) | set(_PROPAGATORS) | {"gets", "getline"},
     key=lambda n: (-len(n), n),
+)
+_SINK_CALLS = frozenset(
+    set(_UNBOUNDED_COPY) | set(_FORMAT_FUNCS) | set(_SCANF) | set(_SHELL_COMMAND) | _EXEC | set(_LENGTH_COPY)
+    | set(_ALLOC) | {"gets"}
 )
 _CALL_RE = re.compile(r"(?<![\w.>:$])(?:(?:std)?::)?(" + "|".join(_ALL_CALLS) + r")\s*\(")
 _NEW_ARRAY_RE = re.compile(r"\bnew\s+(?:[\w:]+(?:\s*<[^<>;\n]{0,60}>)?)\s*\[")
@@ -496,36 +570,74 @@ class _Taint:
     max_len: int | None = None
 
 
-@dataclass
 class _State:
-    tainted: dict[str, list[tuple[int, _Taint]]] = field(default_factory=dict)
-    constant_assigned: dict[str, bool] = field(default_factory=dict)
-    allocs: dict[str, list[tuple[int, str]]] = field(default_factory=dict)
-    resized: dict[str, list[int]] = field(default_factory=dict)
-    # `n = strlen(s)` / `n = s.size()`: n measures s, so checking n bounds s.
-    length_of: dict[str, set[str]] = field(default_factory=dict)
-    # Offsets where a call wrote into a variable (out-parameter, copy).
-    written: dict[str, list[int]] = field(default_factory=dict)
+    """Per-function taint state. Facts are kept with prefix-best arrays so a
+    lookup is a bisect, not a scan of every earlier fact."""
+
+    def __init__(self) -> None:
+        # name -> (positions, best taint up to each position, best string taint)
+        self._facts: dict[str, tuple[list[int], list[_Taint | None], list[_Taint | None]]] = {}
+        self.constant_assigned: dict[str, bool] = {}
+        self.allocs: dict[str, list[tuple[int, str]]] = {}
+        self.resized: dict[str, list[int]] = {}
+        # `n = strlen(s)` / `n = s.size()`: n measures s, so checking n bounds s.
+        self.length_of: dict[str, set[str]] = {}
+        self.measured_by: dict[str, set[str]] = {}
+        # First offset where a call wrote into a variable (out-parameter, copy).
+        self.written_first: dict[str, int] = {}
+        # Offsets where a variable was clamped (`m = MIN(n, cap)`).
+        self.clamped: dict[str, list[int]] = {}
+        self._raw: dict[str, list[object]] = {}
 
     def write(self, name: str, pos: int) -> None:
-        self.written.setdefault(name, []).append(pos)
+        if pos < self.written_first.get(name, pos + 1):
+            self.written_first[name] = pos
 
     def written_before(self, name: str, pos: int) -> bool:
-        return any(p < pos for p in self.written.get(name, ()))
+        return self.written_first.get(name, pos) < pos
+
+    def measure(self, alias: str, measured: set[str]) -> None:
+        self.length_of.setdefault(alias, set()).update(measured)
+        for name in measured:
+            self.measured_by.setdefault(name, set()).add(alias)
 
     def add(self, name: str, pos: int, taint: _Taint) -> None:
-        self.tainted.setdefault(name, []).append((pos, taint))
+        self._record(name, pos, taint)
+
+    def clear(self, name: str, pos: int) -> None:
+        """A reassignment to a constant drops the taint from here on."""
+        if name in self._facts:
+            self._record(name, pos, _CLEAR)
+
+    def _record(self, name: str, pos: int, fact: object) -> None:
+        positions, best_any, best_str = self._facts.setdefault(name, ([], [], []))
+        raw = self._raw.setdefault(name, [])
+        index = bisect.bisect_right(positions, pos)
+        positions.insert(index, pos)
+        raw.insert(index, fact)
+        best_any.insert(index, None)
+        best_str.insert(index, None)
+        for i in range(index, len(positions)):
+            prev_any = best_any[i - 1] if i > 0 else None
+            prev_str = best_str[i - 1] if i > 0 else None
+            item = raw[i]
+            if item is _CLEAR:
+                best_any[i], best_str[i] = None, None
+            else:
+                best_any[i] = _better(prev_any, item)
+                best_str[i] = prev_str if item.numeric else _better(prev_str, item)
 
     def get(self, name: str, before: int, *, want_string: bool) -> _Taint | None:
-        best: _Taint | None = None
-        for pos, taint in self.tainted.get(name, ()):
-            if pos >= before:
-                continue
-            if want_string and taint.numeric:
-                continue
-            if best is None or _rank(taint) > _rank(best):
-                best = taint
-        return best
+        entry = self._facts.get(name)
+        if entry is None:
+            return None
+        index = bisect.bisect_left(entry[0], before) - 1
+        if index < 0:
+            return None
+        return (entry[2] if want_string else entry[1])[index]
+
+
+_CLEAR = object()
 
 
 def _rank(taint: _Taint) -> int:
@@ -569,6 +681,9 @@ class _Ctx:
     constants: set[str]
     int_decl_positions: dict[str, int]
     array_sizes: dict[str, int] = field(default_factory=dict)
+    # name -> sorted offsets of an upper-bound check on it (precomputed).
+    bounds: dict[str, list[int]] = field(default_factory=dict)
+    overflow_guards: list[int] = field(default_factory=list)
 
 
 def _opaque_calls_blanked(text: str) -> str:
@@ -641,7 +756,7 @@ def _is_constant_expr(ctx: _Ctx, lo: int, hi: int, depth: int = 0) -> bool:
     text = ctx.masked[lo:hi].strip()
     if not text or depth > 3:
         return False
-    if _LITERAL_START_RE.match(text) or _ALL_CAPS_RE.match(text):
+    if _LITERAL_ONLY_RE.match(text) or _ALL_CAPS_RE.match(text):
         return True
     if text.startswith("(") and text.endswith(")"):
         inner_lo = ctx.masked.index("(", lo) + 1
@@ -661,6 +776,14 @@ def _is_constant_expr(ctx: _Ctx, lo: int, hi: int, depth: int = 0) -> bool:
             return _is_constant_expr(ctx, offset + question + 1, offset + colon, depth + 1) and _is_constant_expr(
                 ctx, offset + colon + 1, offset + len(text), depth + 1
             )
+    data_call = _DATA_CALL_RE.search(text)
+    if data_call is not None and depth < 3:
+        # `cmd.c_str()` / `fmt.data()`: as constant as the variable itself.
+        base = text[: data_call.start()].strip()
+        ident = _IDENT_RE.fullmatch(base)
+        if ident is None:
+            return False
+        text = base
     ident = _IDENT_RE.fullmatch(text) or _INDEXED_IDENT_RE.fullmatch(text)
     if ident is not None:
         name = ident.group(1) if ident.re is _INDEXED_IDENT_RE else ident.group(0)
@@ -687,37 +810,41 @@ def _top_level_index(text: str, char: str, start: int = 0) -> int:
     return -1
 
 
-def _compared_before(ctx: _Ctx, names: set[str], before: int) -> bool:
-    """A ``<``/``>`` comparison or an assert-style check involving any of
-    ``names`` in the scope before ``before`` (a length or bounds check)."""
-    if not names:
-        return False
-    names = names | {alias for alias, measured in ctx.state.length_of.items() if measured & names}
-    body = ctx.masked
-    for match in _CHECK_CALL_RE.finditer(body, ctx.scope.start, before):
-        parsed = _call_args(body, match.end() - 1)
-        if parsed is not None and set(_IDENT_RE.findall(body[match.end() : parsed[1]])) & names:
-            return True
-    for match in _COMPARE_OP_RE.finditer(body, ctx.scope.start, before):
-        left = body[max(ctx.scope.start, match.start() - _COMPARE_WINDOW) : match.start()]
-        right = body[match.end() : min(before, match.end() + _COMPARE_WINDOW)]
-        left = re.split(r"&&|\|\||[;{}?]|\breturn\b", left)[-1]
-        right = re.split(r"&&|\|\||[;{}?]", right)[0]
-        idents = set(_IDENT_RE.findall(left)) | set(_IDENT_RE.findall(right))
-        if idents & names:
+def _measured_names(ctx: _Ctx, names: set[str]) -> set[str]:
+    """``names`` plus the variables that measure them (``n = strlen(s)``)."""
+    out = set(names)
+    for name in names:
+        out |= ctx.state.measured_by.get(name, set())
+    return out
+
+
+def _any_before(index: dict[str, list[int]], names: set[str], before: int) -> bool:
+    for name in names:
+        positions = index.get(name)
+        if positions and positions[0] < before:
             return True
     return False
+
+
+def _compared_before(ctx: _Ctx, names: set[str], before: int) -> bool:
+    """An upper-bound check (``n < sizeof buf``, ``if (n > cap) return``,
+    ``ck_assert_int_lt(n, cap)``) on any of ``names``, or on a variable that
+    measures one of them, before ``before``. Checks against 0/1/NULL
+    (``n < 0``, ``strlen(s) > 0``) don't bound anything."""
+    return bool(names) and _any_before(ctx.bounds, _measured_names(ctx, names), before)
 
 
 def _clamped(ctx: _Ctx, names: set[str], before: int) -> bool:
-    """A ``x = MIN(...)``-style clamp of any of ``names`` before ``before``."""
-    for name in names:
-        for match in re.finditer(r"\b" + re.escape(name) + r"\s*=(?!=)", ctx.masked[ctx.scope.start : before]):
-            rhs_lo = ctx.scope.start + match.end()
-            rhs = ctx.masked[rhs_lo : min(before, rhs_lo + 200)].split(";", 1)[0]
-            if _CLAMP_RE.search(rhs):
-                return True
-    return False
+    """A ``m = MIN(n, cap)`` / ``m = n > cap ? cap : n`` clamp before ``before``."""
+    return _any_before(ctx.state.clamped, names, before)
+
+
+def _is_clamp_expr(text: str) -> bool:
+    """``MIN(n, cap)`` or a ternary whose condition compares (``n > cap ? cap : n``)."""
+    if _CLAMP_RE.search(text):
+        return True
+    question = _top_level_index(text, "?")
+    return question > 0 and _COMPARE_OP_RE.search(text, 0, question) is not None
 
 
 def _expr_names(ctx: _Ctx, lo: int, hi: int) -> set[str]:
@@ -736,10 +863,7 @@ def _sized_by(ctx: _Ctx, dst: str | None, names: set[str], before: int) -> bool:
     ``before`` (``p = malloc(len + 1); memcpy(p, s, len)``)."""
     if dst is None:
         return False
-    measured = set(names)
-    for alias, of in ctx.state.length_of.items():
-        if of & names:
-            measured.add(alias)
+    measured = _measured_names(ctx, names)
     for pos, expr in ctx.state.allocs.get(dst, ()):
         if pos < before and (_names_in(expr) & measured or "strlen" in expr):
             return True
@@ -748,6 +872,96 @@ def _sized_by(ctx: _Ctx, dst: str | None, names: set[str], before: int) -> bool:
 
 def _names_in(text: str) -> set[str]:
     return set(_IDENT_RE.findall(_SIZEOF_RE.sub(" ", text)))
+
+
+# ---------- Bounds index ----------
+
+# Template argument lists (`static_cast<int>(...)`, `std::vector<char>(n)`):
+# their angle brackets are not comparisons.
+_TEMPLATE_RE = re.compile(
+    r"\b(?:std::\w+|static_cast|reinterpret_cast|const_cast|dynamic_cast|vector|array|basic_string|unique_ptr|"
+    r"shared_ptr|make_shared|make_unique|numeric_limits|map|unordered_map|set|unordered_set|pair|tuple|function|"
+    r"optional|span|string_view|list|deque|initializer_list|atomic|request|response)\s*<[^<>;()\n]{0,80}>"
+)
+_TRIVIAL_BOUND_RE = re.compile(
+    r"^[\s(]*(?:\(\s*[A-Za-z_][\w:\s*]{0,40}\)\s*)?(?:[-+]?\s*[01](?:[uUlL]{0,3})|0x0+|NULL|nullptr|true|false|'\s*'|EOF)[\s)]*$"
+)
+_BOUND_CHECK_CALL_RE = re.compile(
+    r"\b(?:\w*_(?:lt|le|gt|ge)|\w*(?:EXPECT|ASSERT|CHECK|REQUIRE|DCHECK)_(?:LT|LE|GT|GE))\s*\("
+)
+_OPERAND_STOP = frozenset(";,?:{}")
+
+
+def _left_operand(masked: str, op: int, floor: int) -> str:
+    depth = 0
+    i = op - 1
+    lo = max(floor, op - _COMPARE_WINDOW)
+    while i >= lo:
+        c = masked[i]
+        if c in ")]":
+            depth += 1
+        elif c in "([":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and (c in _OPERAND_STOP or masked[i - 1 : i + 1] in ("&&", "||") or (c == "=" and masked[i - 1 : i] not in ("=", "!", "<", ">"))):
+            break
+        i -= 1
+    text = masked[i + 1 : op]
+    return text[text.rfind("return") + 6 :] if "return" in text else text
+
+
+def _right_operand(masked: str, op_end: int, ceiling: int) -> str:
+    depth = 0
+    i = op_end
+    hi = min(ceiling, op_end + _COMPARE_WINDOW)
+    while i < hi:
+        c = masked[i]
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and (c in _OPERAND_STOP or masked[i : i + 2] in ("&&", "||")):
+            break
+        i += 1
+    return masked[op_end:i]
+
+
+def _operand_names(text: str) -> list[str]:
+    stripped = _SIZEOF_RE.sub(" ", text)
+    out = []
+    for match in _IDENT_RE.finditer(stripped):
+        before = stripped[max(0, match.start() - 2) : match.start()]
+        if not (before.endswith(".") or before == "->"):
+            out.append(match.group(0))
+    return out
+
+
+def _bound_entries(masked: str, op: re.Match[str], floor: int, ceiling: int) -> list[tuple[str, int]]:
+    left = _left_operand(masked, op.start(), floor)
+    right = _right_operand(masked, op.end(), ceiling)
+    out: list[tuple[str, int]] = []
+    if right.strip() and not _TRIVIAL_BOUND_RE.match(right):
+        out.extend((name, op.start()) for name in _operand_names(left))
+    if left.strip() and not _TRIVIAL_BOUND_RE.match(left):
+        out.extend((name, op.start()) for name in _operand_names(right))
+    return out
+
+
+def _check_call_entries(masked: str, match: re.Match[str]) -> list[tuple[str, int]]:
+    parsed = _call_args(masked, match.end() - 1)
+    if parsed is None or len(parsed[0]) < 2:
+        return []
+    (a_lo, a_hi), (b_lo, b_hi) = parsed[0][0], parsed[0][1]
+    first, second = masked[a_lo:a_hi], masked[b_lo:b_hi]
+    out: list[tuple[str, int]] = []
+    if not _TRIVIAL_BOUND_RE.match(second):
+        out.extend((n, match.start()) for n in _operand_names(first))
+    if not _TRIVIAL_BOUND_RE.match(first):
+        out.extend((n, match.start()) for n in _operand_names(second))
+    return out
 
 
 # ---------- Scope analysis ----------
@@ -761,13 +975,41 @@ class _Hit:
     traced_direct: bool = False
 
 
-def _scope_hits(masked: str, orig: str, scope: _Scope, file_constants: set[str]) -> list[_Hit]:
-    body_lo, body_hi = scope.start, scope.end
+@dataclass
+class _ScopeData:
+    """Everything one pass over the file found inside one function/lambda
+    (its own body only; nested lambdas have their own)."""
+
+    events: list[tuple[int, int, re.Match[str]]] = field(default_factory=list)
+    int_vars: set[str] = field(default_factory=set)
+    int_decl_positions: dict[str, int] = field(default_factory=dict)
+    constants: set[str] = field(default_factory=set)
+    array_sizes: dict[str, int] = field(default_factory=dict)
+    mg_locals: dict[str, int] = field(default_factory=dict)
+    resized: dict[str, list[int]] = field(default_factory=dict)
+    bounds: dict[str, list[int]] = field(default_factory=dict)
+    overflow_guards: list[int] = field(default_factory=list)
+    has_sink: bool = False
+
+
+def _request_param(decl: str, gates: frozenset[str]) -> bool:
+    """A parameter declared with a known framework request type. Bare names
+    (`Request`, `Rest::Request`, `request<...>`, `shared_ptr<Session>`) count
+    only in a file that uses that framework; `struct Request` never does."""
+    if _STRUCT_REQUEST_RE.search(decl):
+        return _MG_REQUEST_TYPE_RE.search(decl) is not None
+    if _REQUEST_TYPE_RE.search(decl):
+        return True
+    return any(gate in gates and pattern.search(decl) for gate, pattern in _GATED_REQUEST_TYPES)
+
+
+def _scope_hits(masked: str, orig: str, scope: _Scope, data: _ScopeData, inherited: _ScopeData,
+                gates: frozenset[str]) -> list[_Hit]:
     state = _State()
     request_vars: set[str] = set()
     for piece in _split_top(scope.params, 0, len(scope.params)):
         decl = scope.params[piece[0] : piece[1]]
-        if _REQUEST_TYPE_RE.search(decl):
+        if _request_param(decl, gates):
             names = _IDENT_RE.findall(re.sub(r"<[^<>]*>", " ", decl.split("=", 1)[0]))
             if names:
                 request_vars.add(names[-1])
@@ -777,27 +1019,11 @@ def _scope_hits(masked: str, orig: str, scope: _Scope, file_constants: set[str])
         request_vars |= set(_OATPP_PARAM_RE.findall(scope.params_orig))
     header_line = line_of(orig, scope.start)
     request_lines = {name: header_line for name in request_vars}
-    for match in _MG_LOCAL_DECL_RE.finditer(masked, body_lo, body_hi):
-        request_lines.setdefault(match.group(1), line_of(orig, match.start()))
+    for name, line in data.mg_locals.items():
+        request_lines.setdefault(name, line)
 
-    int_vars: set[str] = set()
-    int_decl_positions: dict[str, int] = {}
-    for match in _INT_DECL_RE.finditer(scope.params):
-        int_vars.add(match.group(1))
-    for match in _INT_DECL_RE.finditer(masked, body_lo, body_hi):
-        int_vars.add(match.group(1))
-        int_decl_positions.setdefault(match.group(1), match.start())
-
-    constants = set(file_constants)
-    for match in _DECL_STRING_LITERAL_RE.finditer(masked, body_lo, body_hi):
-        constants.add(match.group(1))
-    array_sizes: dict[str, int] = {}
-    for match in _ARRAY_DECL_START_RE.finditer(masked, body_lo, body_hi):
-        end = masked.find(";", match.end(), min(body_hi, match.end() + 400))
-        if end > 0:
-            for decl in _ARRAY_DECLARATOR_RE.finditer(masked[match.end() : end]):
-                array_sizes.setdefault(decl.group(1), int(decl.group(2)))
-
+    int_vars = set(_param_int_vars(scope.params)) | data.int_vars | inherited.int_vars
+    state.resized = data.resized
     ctx = _Ctx(
         masked=masked,
         orig=orig,
@@ -806,30 +1032,14 @@ def _scope_hits(masked: str, orig: str, scope: _Scope, file_constants: set[str])
         request_vars=request_lines,
         argv_scope="argv" in scope.param_names or bool(_ARGV_PARAM_RE.search(scope.params)),
         int_vars=int_vars,
-        constants=constants,
-        int_decl_positions=int_decl_positions,
-        array_sizes=array_sizes,
+        constants=data.constants | inherited.constants,
+        int_decl_positions=data.int_decl_positions,
+        array_sizes={**inherited.array_sizes, **data.array_sizes},
+        bounds=data.bounds,
+        overflow_guards=data.overflow_guards,
     )
-
-    events: list[tuple[int, int, re.Match[str]]] = []
-    for match in _ASSIGN_RE.finditer(masked, body_lo, body_hi):
-        events.append((match.end() - 1, 0, match))
-    for match in _CALL_RE.finditer(masked, body_lo, body_hi):
-        events.append((match.start(), 1, match))
-    for match in _CIN_RE.finditer(masked, body_lo, body_hi):
-        events.append((match.start(), 2, match))
-    for match in _GETLINE_CIN_RE.finditer(masked, body_lo, body_hi):
-        events.append((match.start(), 2, match))
-    for match in _NEW_ARRAY_RE.finditer(masked, body_lo, body_hi):
-        events.append((match.start(), 3, match))
-    for match in _STRING_CTOR_DECL_RE.finditer(masked, body_lo, body_hi):
-        events.append((match.end() - 1, 4, match))
-    for match in _RESIZE_RE.finditer(masked, body_lo, body_hi):
-        state.resized.setdefault(match.group(1), []).append(match.start())
-    events.sort(key=lambda e: (e[0], e[1]))
-
     hits: list[_Hit] = []
-    for pos, etype, match in events:
+    for _pos, etype, match in data.events:
         if etype == 0:
             _on_assign(ctx, match)
         elif etype == 1:
@@ -843,6 +1053,10 @@ def _scope_hits(masked: str, orig: str, scope: _Scope, file_constants: set[str])
             if hit is not None:
                 hits.append(hit)
     return hits
+
+
+def _param_int_vars(params: str) -> list[str]:
+    return [m.group(1) for m in _INT_DECL_RE.finditer(params)]
 
 
 def _rhs_span(masked: str, lo: int, hi_limit: int) -> int:
@@ -877,6 +1091,9 @@ def _on_assign(ctx: _Ctx, match: re.Match[str]) -> None:
         is_const = _is_constant_expr(ctx, rhs_lo, rhs_hi)
         previous = ctx.state.constant_assigned.get(name)
         ctx.state.constant_assigned[name] = is_const if previous is None else (previous and is_const)
+        if is_const:
+            ctx.state.clear(name, rhs_lo)  # `u = "default";` drops earlier input
+            return
     alloc = _ALLOC_ASSIGN_RE.match(ctx.masked, match.start())
     if alloc is not None:
         ctx.state.allocs.setdefault(name, []).append((match.end(), rhs))
@@ -885,13 +1102,14 @@ def _on_assign(ctx: _Ctx, match: re.Match[str]) -> None:
     call = _CALL_RE.match(_LEADING_CAST_RE.sub("", stripped, count=1))
     if call is not None and call.group(1) in _OUT_PARAM_SOURCES and call.group(1) not in ("gets",):
         return
-    if _CLAMP_RE.search(rhs):
+    if _is_clamp_expr(rhs):
+        ctx.state.clamped.setdefault(name, []).append(rhs_lo)
         return
     numeric_rhs = _is_numeric_expr(ctx, rhs)
     if numeric_rhs:
         measured = _expr_names(ctx, rhs_lo, rhs_hi) - {name}
         if measured:
-            ctx.state.length_of.setdefault(name, set()).update(measured)
+            ctx.state.measure(name, measured)
     taint = _expr_taint(ctx, rhs_lo, rhs_hi, want_string=False)
     if taint is None:
         return
@@ -1078,19 +1296,24 @@ def _check_strcpy(ctx: _Ctx, args: list[tuple[int, int]], pos: int) -> _Hit | No
         return None
     src_names = _expr_names(ctx, *args[1])
     dst = _base_ident(ctx.masked[args[0][0] : args[0][1]])
-    if not _overflows(ctx, taint, dst):
+    if not _overflows(ctx, taint, dst, _base_ident(ctx.masked[args[1][0] : args[1][1]])):
         return None
     if _compared_before(ctx, src_names, pos) or _sized_by(ctx, dst, src_names, pos):
         return None
     return _Hit("unbounded_copy", pos, taint, _direct(ctx, args[1]))
 
 
-def _overflows(ctx: _Ctx, taint: _Taint, dst: str | None) -> bool:
-    """Can a copy of ``taint`` overflow ``dst``? An unbounded string can; a
-    bounded one only into a declared array smaller than its cap."""
+def _overflows(ctx: _Ctx, taint: _Taint, dst: str | None, src: str | None = None) -> bool:
+    """Can a copy of ``taint`` overflow ``dst``? Not when both are declared
+    arrays and ``dst`` is at least as large as ``src``. Otherwise an
+    unbounded string can; a bounded one only into a declared array smaller
+    than its cap."""
+    size = ctx.array_sizes.get(dst) if dst else None
+    src_size = ctx.array_sizes.get(src) if src else None
+    if size is not None and src_size is not None and size >= src_size:
+        return False
     if not taint.bounded:
         return True
-    size = ctx.array_sizes.get(dst) if dst else None
     return size is not None and taint.max_len is not None and size < taint.max_len
 
 
@@ -1144,7 +1367,7 @@ def _check_sprintf(ctx: _Ctx, args: list[tuple[int, int]], fmt_index: int, pos: 
             names = _expr_names(ctx, *span)
             if (
                 taint is not None
-                and _overflows(ctx, taint, dst)
+                and _overflows(ctx, taint, dst, _base_ident(ctx.masked[span[0] : span[1]]))
                 and not _compared_before(ctx, names, pos)
                 and not _sized_by(ctx, dst, names, pos)
                 and (best is None or _rank(taint) > _rank(best.taint))  # type: ignore[arg-type]
@@ -1243,8 +1466,8 @@ def _check_length_copy(ctx: _Ctx, args: list[tuple[int, int]], spec: tuple[int, 
         return None
     span = args[len_index]
     text = ctx.masked[span[0] : span[1]]
-    if _CLAMP_RE.search(text):
-        return None
+    if _is_clamp_expr(text):
+        return None  # `n > sizeof b ? sizeof b : n`
     taint = _expr_taint(ctx, span[0], span[1], want_string=False)
     if taint is None:
         return None
@@ -1277,7 +1500,7 @@ def _check_alloc(ctx: _Ctx, span: tuple[int, int], pos: int) -> _Hit | None:
     terms = _product_terms(ctx.masked, span[0], span[1])
     if not terms:
         return None
-    if _OVERFLOW_GUARD_RE.search(ctx.masked, ctx.scope.start, pos):
+    if ctx.overflow_guards and ctx.overflow_guards[0] < pos:
         return None
     taint: _Taint | None = None
     names: set[str] = set()
@@ -1335,6 +1558,125 @@ def _snippet(content: str, offset: int) -> str:
     return line
 
 
+def _owner_index(scopes: list[_Scope], starts: list[int], pos: int) -> int | None:
+    """Index of the innermost scope containing ``pos``: walking back from the
+    last scope that starts before it, the first one still open at ``pos``."""
+    i = bisect.bisect_left(starts, pos) - 1
+    for _ in range(_MAX_OWNER_WALK):
+        if i < 0:
+            return None
+        if scopes[i].end > pos:
+            return i
+        i -= 1
+    return None
+
+
+def _scope_data(masked: str, orig: str, scopes: list[_Scope]) -> list[_ScopeData]:
+    """One pass per pattern over the whole file, each match filed under its
+    innermost scope, so nested lambdas aren't rescanned by their parents."""
+    starts = [s.start for s in scopes]
+    data = [_ScopeData() for _ in scopes]
+
+    def owner(pos: int) -> _ScopeData | None:
+        index = _owner_index(scopes, starts, pos)
+        return None if index is None else data[index]
+
+    def owner_index(pos: int) -> int | None:
+        return _owner_index(scopes, starts, pos)
+
+    for match in _ASSIGN_RE.finditer(masked):
+        d = owner(match.end() - 1)
+        if d is not None:
+            d.events.append((match.end() - 1, 0, match))
+    for match in _CALL_RE.finditer(masked):
+        d = owner(match.start())
+        if d is not None:
+            d.events.append((match.start(), 1, match))
+            d.has_sink = d.has_sink or match.group(1) in _SINK_CALLS
+    for pattern in (_CIN_RE, _GETLINE_CIN_RE):
+        for match in pattern.finditer(masked):
+            d = owner(match.start())
+            if d is not None:
+                d.events.append((match.start(), 2, match))
+    for match in _NEW_ARRAY_RE.finditer(masked):
+        d = owner(match.start())
+        if d is not None:
+            d.events.append((match.start(), 3, match))
+            d.has_sink = True
+    for match in _STRING_CTOR_DECL_RE.finditer(masked):
+        d = owner(match.end() - 1)
+        if d is not None:
+            d.events.append((match.end() - 1, 4, match))
+    for match in _RESIZE_RE.finditer(masked):
+        d = owner(match.start())
+        if d is not None:
+            d.resized.setdefault(match.group(1), []).append(match.start())
+    for match in _INT_DECL_RE.finditer(masked):
+        d = owner(match.start())
+        if d is not None:
+            d.int_vars.add(match.group(1))
+            d.int_decl_positions.setdefault(match.group(1), match.start())
+    for match in _DECL_STRING_LITERAL_RE.finditer(masked):
+        d = owner(match.start())
+        if d is not None:
+            d.constants.add(match.group(1))
+    for match in _ARRAY_DECL_START_RE.finditer(masked):
+        d = owner(match.start())
+        if d is None:
+            continue
+        end = masked.find(";", match.end(), match.end() + 400)
+        if end > 0:
+            for decl in _ARRAY_DECLARATOR_RE.finditer(masked[match.end() : end]):
+                d.array_sizes.setdefault(decl.group(1), int(decl.group(2)))
+    for match in _MG_LOCAL_DECL_RE.finditer(masked):
+        d = owner(match.start())
+        if d is not None:
+            d.mg_locals.setdefault(match.group(1), line_of(orig, match.start()))
+    for match in _OVERFLOW_GUARD_RE.finditer(masked):
+        d = owner(match.start())
+        if d is not None:
+            d.overflow_guards.append(match.start())
+    template_brackets: set[int] = set()
+    for match in _TEMPLATE_RE.finditer(masked):
+        template_brackets.add(masked.index("<", match.start()))
+        template_brackets.add(match.end() - 1)
+    for match in _COMPARE_OP_RE.finditer(masked):
+        if match.start() in template_brackets:
+            continue
+        index = owner_index(match.start())
+        if index is None:
+            continue
+        scope = scopes[index]
+        for name, pos in _bound_entries(masked, match, scope.start, scope.end):
+            data[index].bounds.setdefault(name, []).append(pos)
+    for match in _BOUND_CHECK_CALL_RE.finditer(masked):
+        d = owner(match.start())
+        if d is not None:
+            for name, pos in _check_call_entries(masked, match):
+                d.bounds.setdefault(name, []).append(pos)
+    for d in data:
+        d.events.sort(key=lambda e: (e[0], e[1]))
+        for positions in d.bounds.values():
+            positions.sort()
+    return data
+
+
+def _inherited(scopes: list[_Scope], data: list[_ScopeData], index: int) -> _ScopeData:
+    """Declarations a lambda sees from its enclosing scopes (a few levels)."""
+    out = _ScopeData()
+    parent = scopes[index].parent
+    for _ in range(_MAX_INHERIT_DEPTH):
+        if parent is None:
+            break
+        d = data[parent]
+        out.int_vars |= d.int_vars
+        out.constants |= d.constants
+        for name, size in d.array_sizes.items():
+            out.array_sizes.setdefault(name, size)
+        parent = scopes[parent].parent
+    return out
+
+
 def find_native_weaknesses(content: str, relative: str) -> list[CodeWeakness]:
     """C/C++ memory-safety and command-exec weaknesses in one file."""
     if CodeWeakness is None or is_test_path(relative):
@@ -1343,23 +1685,23 @@ def find_native_weaknesses(content: str, relative: str) -> list[CodeWeakness]:
     if _CALL_RE.search(masked) is None and _NEW_ARRAY_RE.search(masked) is None:
         return []
     file_constants = set(_DEFINE_STRING_RE.findall(content))
-    for match in _DECL_STRING_LITERAL_RE.finditer(masked):
-        file_constants.add(match.group(1))
+    gates = frozenset(gate for gate, pattern in _FRAMEWORK_GATES if pattern.search(content))
     downranked = _is_downranked(relative)
     scopes = _scopes(masked, content)
+    data = _scope_data(masked, content, scopes)
+    # File-scope string constants (`static const char *usage = "..."`).
     starts = [s.start for s in scopes]
-    # Each sink belongs to its innermost enclosing function or lambda.
-    owner: dict[int, _Scope] = {}
-    for match in _CALL_RE.finditer(masked):
-        _assign_owner(owner, scopes, starts, match.start())
-    for match in _NEW_ARRAY_RE.finditer(masked):
-        _assign_owner(owner, scopes, starts, match.start())
+    for match in _DECL_STRING_LITERAL_RE.finditer(masked):
+        if _owner_index(scopes, starts, match.start()) is None:
+            file_constants.add(match.group(1))
     out: list[CodeWeakness] = []
     seen: set[tuple[str, int]] = set()
-    for scope in {id(s): s for s in owner.values()}.values():
-        for hit in _scope_hits(masked, content, scope, file_constants):
-            if owner.get(hit.pos) is not scope:
-                continue  # found while scanning an enclosing scope
+    for index, scope in enumerate(scopes):
+        if not data[index].has_sink:
+            continue
+        inherited = _inherited(scopes, data, index)
+        inherited.constants |= file_constants
+        for hit in _scope_hits(masked, content, scope, data[index], inherited, gates):
             line = line_of(content, hit.pos)
             key = (hit.kind, line)
             if key in seen:
@@ -1380,19 +1722,6 @@ def find_native_weaknesses(content: str, relative: str) -> list[CodeWeakness]:
             )
     out.sort(key=lambda w: (w.line or 0, w.kind))
     return out
-
-
-def _assign_owner(owner: dict[int, _Scope], scopes: list[_Scope], starts: list[int], pos: int) -> None:
-    """The innermost scope containing ``pos``: walking back from the last
-    scope that starts before it, the first one still open at ``pos``."""
-    i = bisect.bisect_left(starts, pos) - 1
-    for _ in range(_MAX_OWNER_WALK):
-        if i < 0:
-            return
-        if scopes[i].end > pos:
-            owner[pos] = scopes[i]
-            return
-        i -= 1
 
 
 __all__ = ["find_native_weaknesses", "is_test_path", "mask_source"]

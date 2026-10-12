@@ -22,6 +22,7 @@ C ecosystem coverage:
 - **Databases**: sqlite3, libpq, MySQL/MariaDB C client, hiredis, MongoDB C driver
 - **Auth/crypto**: OpenSSL (TLS / EVP / RAND), mbedTLS, libsodium (`crypto_pwhash` → argon2; AEAD primitives), Argon2 / bcrypt / scrypt reference impls, JWT C libs
 - **Secrets**: `getenv` / `secure_getenv` / `getenv_s` with secret-shaped names
+- **Native sinks** (`native_sinks.py`): unbounded copies, non-constant formats, command execution, input-controlled copy lengths and allocation-size overflows, emitted as `CodeWeakness` records with per-instance severity/confidence (AttackMap#189)
 
 ## Out of scope (for now)
 - libmicrohttpd per-route extraction — single-callback routing dispatches on `url` inside the handler; we'd need to regex out `if (strcmp(url, "/x") == 0)` patterns to recover paths.
@@ -40,6 +41,14 @@ This analyzer is marked `experimental=True` on its metadata because:
 - Canonical TLS / cipher / JWT API hits (`SSL_CTX_new`, `EVP_*`, `jwt_encode`, `mbedtls_ssl_*`) → 0.85
 - Generic `EVP` / `RAND` family → 0.8
 - Keyword sweeps (`Authorization`, `Bearer`, `api_key`) → 0.6
+
+## Native sinks (`native_sinks.py`)
+- Function-local: a sink is judged only against sources traced in its enclosing function or lambda, in textual order. Taint is never cleared. It doesn't flow through unknown free-function calls.
+- Precision over recall. An untraced `strcpy`/`memcpy`/`malloc` is never reported. Only a non-constant format or command is reported without a traced source, and then at low.
+- Severity/confidence: request or network input → high/high, local input (stdin, argv, env, file) → medium/medium, untraced → low/low. Example/demo/contrib paths are capped at low. Test/fuzz/bench paths are skipped unless `ATTACKMAP_INCLUDE_TESTS` is set.
+- The module is **mirrored verbatim** in attackmap-analyzer-cpp, together with `tests/test_native_sinks.py` (the C++ copy adds C++ framework cases). Change both together.
+- All scanners are bounded (`_MAX_*` constants) and patterns are module-level and linear. `test_fuzz_never_raises` and `test_pathological_input_is_fast` guard that.
+- Every new sink, source or guard needs a positive and a negative test, and a real-repo validation run (civetweb, mongoose, cpp-httplib, drogon, Crow, restbed, oat++ example-crud). Put the hand-checked numbers in the PR.
 
 ## C-vs-C++ disambiguation
 `detect()` needs at least one `.c` file. A lone `.h` or a `CMakeLists.txt` next to `.cpp` files (and no `.c`) is **not** claimed; the C++ analyzer (`attackmap-analyzer-cpp`) takes those. A repo with both `.c` and `.cpp` files is claimed by both, and each analyzes only the files it owns.

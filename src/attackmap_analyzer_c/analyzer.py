@@ -13,6 +13,9 @@ Coverage (v0.1):
   bcrypt-c, scrypt
 - Secrets: getenv / secure_getenv / getenv_s with secret-shaped names
 - Service hints: project name from CMakeLists.txt
+- Native sinks (AttackMap#189): unbounded copies, non-constant formats,
+  command execution, input-controlled copy lengths and allocation-size
+  overflows, emitted as ``CodeWeakness`` records (see ``native_sinks``)
 
 C is more fragmented than other ecosystems — there's no single dominant
 HTTP framework, and routing patterns vary widely. We capture what regex
@@ -26,6 +29,7 @@ from pathlib import Path
 
 from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
 
+from .native_sinks import find_native_weaknesses
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -185,8 +189,8 @@ class CAnalyzer:
         name="c",
         display_name="C Analyzer",
         version="0.1.0",
-        description="C ecosystem analyzer covering libmicrohttpd, civetweb, mongoose, libonion, libcurl, OpenSSL, libsodium, sqlite3, libpq, mysql, hiredis, mongoc.",
-        scope="C source trees and CMake/Make projects. Detects HTTP server entrypoints, libcurl outbound calls, common DB and crypto libraries.",
+        description="C ecosystem analyzer covering libmicrohttpd, civetweb, mongoose, libonion, libcurl, OpenSSL, libsodium, sqlite3, libpq, mysql, hiredis, mongoc, plus memory-safety and command-exec sinks.",
+        scope="C source trees and CMake/Make projects. Detects HTTP server entrypoints, libcurl outbound calls, common DB and crypto libraries, and function-local memory-safety / format-string / command-exec sinks tied to request and input sources.",
         targets=["c", "civetweb", "libmicrohttpd", "mongoose"],
         languages=["c"],
         priority=20,
@@ -266,6 +270,7 @@ class CAnalyzer:
             self._extract_external_calls(content, relative, result)
             self._extract_frameworks(content, relative, result)
             self._extract_entrypoints(content, relative, result)
+            result.code_weaknesses.extend(find_native_weaknesses(content, relative))
 
         result.languages.sort()
         return result

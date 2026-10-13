@@ -8,6 +8,7 @@ negative cases; severity follows the source traced in the same function.
 from __future__ import annotations
 
 import random
+import re
 import time
 from pathlib import Path
 
@@ -494,6 +495,55 @@ def test_unterminated_constructs_are_linear() -> None:
 def test_nested_lambdas_are_not_rescanned() -> None:
     text = "void f() {" + "auto l = [&](const httplib::Request &req) { memcpy(a, b, req.body.size());" * 500 + "}" * 1000
     assert _timed(text) < 3
+
+
+
+def test_hostile_identifiers_are_linear() -> None:
+    # Round-2 review: `"ls" aaaa…!` made the literal-only check split the
+    # identifier 2^n ways; long identifiers before `.resize(`/`=` were
+    # quadratic.
+    ident = "a" * 5000
+    assert _timed(f'void f() {{ system("ls" {"a" * 60}!); printf("x" {"b" * 60}!); }}') < 1
+    assert _timed(f"void f() {{ {ident}!.resize(1); {ident}! = malloc(n); char {ident}!; }}") < 1
+    assert _timed("void f() { char b[4]; if (n > " + " " * 20000 + "1) return; memcpy(b, s, n); }") < 1
+
+
+_HOSTILE = (
+    "a{0}!", '"ls" a{0}!', "x = a{0}!", "char a{0}!", "#define a{0}!", "(a.){0}", "(a->){0}", "(a::){0}", " {0}!",
+    "({0}", "[{0}", "<{0}", "%{0}", '"a{0}', "(a ){0}!", "(a*){0}", "(a=){0}", "(a,){0}", "(a[1]){0}",
+    '("x" ){0}!', "1{0}!", '("x" a ){0}!', "(a\t){0}", "(<a){0}", "(a<){0}",
+)
+
+
+def _hostile(n: int) -> list[str]:
+    out = []
+    for shape in _HOSTILE:
+        if shape.startswith("(") and "){0}" in shape:
+            unit = shape[1 : shape.index("){0}")]
+            out.append(unit * n + shape[shape.index("){0}") + 4 :])
+        else:
+            head, tail = shape.split("{0}")
+            out.append(head[:-1] + head[-1] * n + tail)
+    return out
+
+
+def test_every_module_regex_is_linear_on_hostile_text() -> None:
+    from attackmap_analyzer_c import native_sinks
+
+    patterns = {name: value for name, value in vars(native_sinks).items() if isinstance(value, re.Pattern)}
+    # Only ever matched against operands of at most _TRIVIAL_BOUND_MAX chars.
+    patterns.pop("_TRIVIAL_BOUND_RE")
+    assert len(patterns) > 40
+    slow = []
+    for name, pattern in patterns.items():
+        for text in (*_hostile(24), *_hostile(4000)):
+            start = time.perf_counter()
+            list(pattern.finditer(text))
+            pattern.match(text)
+            if time.perf_counter() - start > 0.05:
+                slow.append((name, text[:20]))
+    assert slow == []
+    assert native_sinks._is_trivial_bound(" " * 20000 + "1") is False
 
 
 # ---------- analyzer integration ----------

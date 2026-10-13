@@ -169,7 +169,7 @@ _CONTROL_WORDS = frozenset(
 )
 _TRAILING_QUALIFIERS = frozenset({"const", "noexcept", "override", "final", "mutable", "volatile", "throw"})
 _BRACE_RE = re.compile(r"[{}]")
-_WORD_BEFORE_RE = re.compile(r"([A-Za-z_]\w*)\s*$")
+_WORD_BEFORE_RE = re.compile(r"(?<!\w)([A-Za-z_]\w*)\s*$")
 _TRAILING_RETURN_RE = re.compile(r"->\s*[\w:<>,\s*&]{1,80}$")
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
 _SIZEOF_RE = re.compile(r"\bsizeof\s*(?:\([^()]{0,200}\)|[A-Za-z_]\w*)")
@@ -451,12 +451,12 @@ _INT_DECL_RE = re.compile(
 )
 _CLAMP_RE = re.compile(r"\b(?:MIN|min|std::min|MG_MIN|g_min|qMin)\s*[(<]")
 _ALLOC_ASSIGN_RE = re.compile(
-    r"([A-Za-z_]\w*)\s*(?:\[[^\]\n]{0,80}\])?\s*=\s*(?:\([^()\n]{1,60}\)\s*)?"
+    r"(?<!\w)([A-Za-z_]\w*)\s*(?:\[[^\]\n]{0,80}\])?\s*=\s*(?:\([^()\n]{1,60}\)\s*)?"
     r"(?:(?:std::)?(?:malloc|calloc|realloc|alloca|_alloca|xmalloc|xcalloc|xrealloc|mg_malloc|mg_calloc|"
     r"mg_realloc|mg_malloc_ctx|mg_calloc_ctx|g_malloc|g_malloc0|OPENSSL_malloc)\s*\("
     r"|new\s+[\w:]+(?:\s*<[^<>;\n]{0,60}>)?\s*\[)"
 )
-_RESIZE_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:\.|->)\s*(?:resize|reserve|assign)\s*\(")
+_RESIZE_RE = re.compile(r"(?<!\w)([A-Za-z_]\w*)\s*(?:\.|->)\s*(?:resize|reserve|assign)\s*\(")
 _ASSIGN_RE = re.compile(
     r"(?<![\w.>])([A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*){0,4})\s*(?:\[[^\]\n]{0,80}\])?\s*"
     r"(?:[+\-*/|&^%]|<<|>>)?=(?!=)"
@@ -467,7 +467,7 @@ _DECL_STRING_LITERAL_RE = re.compile(
 )
 # `char buf[256], small[16];`: declared byte/char arrays with a literal size.
 _ARRAY_DECL_START_RE = re.compile(r"\b(?:char|wchar_t|TCHAR|u?int8_t|BYTE|uchar)\s+(?=[*\s]*[A-Za-z_])")
-_ARRAY_DECLARATOR_RE = re.compile(r"(?:^|,)\s*\**\s*([A-Za-z_]\w*)\s*\[\s*(\d{1,9})\s*\]")
+_ARRAY_DECLARATOR_RE = re.compile(r"(?:^|,)\s*(?:\*+\s*)?([A-Za-z_]\w*)\s*\[\s*(\d{1,9})\s*\]")
 # `x.c_str()` / `p->data()`: a call that only exposes a variable's data.
 _DATA_CALL_RE = re.compile(r"(?:\.|->)\s*(?:c_str|data|get|str|toStdString|constData|toUtf8)\s*\(\s*\)\s*$")
 # A call to a free function (not a method): `f(`, `ns::f(`, `f<T>(`.
@@ -490,7 +490,7 @@ _PASSTHROUGH_CALLS = frozenset(
     }
 )
 _LEADING_CAST_RE = re.compile(r"^\(\s*(?:unsigned\s+|signed\s+|const\s+)?[A-Za-z_][\w:]*\s*\**\s*\)\s*")
-_INDEXED_IDENT_RE = re.compile(r"([A-Za-z_]\w*)\s*\[[^\]]{0,60}\]")
+_INDEXED_IDENT_RE = re.compile(r"(?<!\w)([A-Za-z_]\w*)\s*\[[^\]]{0,60}\]")
 # Copies that bound the destination (its content stays input, its length
 # doesn't grow past the destination).
 _BOUNDED_PROPAGATORS = frozenset(
@@ -507,8 +507,9 @@ _MUL_RE = re.compile(r"[\w)\]]\s*(?:\*(?![*/=)])|<<(?!=))")
 _GETTEXT_RE = re.compile(r"^\s*(?:_|N_|gettext|dgettext|_T|TEXT|L|tr|QObject::tr)\s*\(")
 _ALL_CAPS_RE = re.compile(r"^\s*[A-Z][A-Z0-9_]*\s*$")
 # Literals only, possibly concatenated with macros (`"%" PRIu64 "\n"`);
-# `"ping " + host` is not constant.
-_LITERAL_ONLY_RE = re.compile(r"^\s*(?:u8|[uUL])?\"[^\"\n]*\"(?:\s*(?:(?:u8|[uUL])?\"[^\"\n]*\"|[A-Za-z_]\w*))*\s*$")
+# `"ping " + host` is not constant. Each macro name is a whole word (`\b` on
+# both sides), so a long identifier can't be split 2^n ways.
+_LITERAL_ONLY_RE = re.compile(r"^\s*(?:u8|[uUL])?\"[^\"\n]*\"(?:\s*(?:(?:u8|[uUL])?\"[^\"\n]*\"|\b[A-Za-z_]\w*\b))*\s*$")
 _LITERAL_START_RE = re.compile(r"^\s*(?:u8|[uUL])?\"")
 _CONVERSION_RE = re.compile(
     r"%(?:%|(?P<flags>[-+ #0']*)(?P<width>\*|\d+)?(?:\.(?P<prec>\*|\d+))?"
@@ -883,6 +884,10 @@ _TEMPLATE_RE = re.compile(
     r"shared_ptr|make_shared|make_unique|numeric_limits|map|unordered_map|set|unordered_set|pair|tuple|function|"
     r"optional|span|string_view|list|deque|initializer_list|atomic|request|response)\s*<[^<>;()\n]{0,80}>"
 )
+# Only short operands are tested (`_is_trivial_bound`): a trivial bound is a
+# few characters, and the leading/trailing space runs would otherwise
+# backtrack quadratically on a long one.
+_TRIVIAL_BOUND_MAX = 120
 _TRIVIAL_BOUND_RE = re.compile(
     r"^[\s(]*(?:\(\s*[A-Za-z_][\w:\s*]{0,40}\)\s*)?(?:[-+]?\s*[01](?:[uUlL]{0,3})|0x0+|NULL|nullptr|true|false|'\s*'|EOF)[\s)]*$"
 )
@@ -939,13 +944,17 @@ def _operand_names(text: str) -> list[str]:
     return out
 
 
+def _is_trivial_bound(text: str) -> bool:
+    return len(text) <= _TRIVIAL_BOUND_MAX and _TRIVIAL_BOUND_RE.match(text) is not None
+
+
 def _bound_entries(masked: str, op: re.Match[str], floor: int, ceiling: int) -> list[tuple[str, int]]:
     left = _left_operand(masked, op.start(), floor)
     right = _right_operand(masked, op.end(), ceiling)
     out: list[tuple[str, int]] = []
-    if right.strip() and not _TRIVIAL_BOUND_RE.match(right):
+    if right.strip() and not _is_trivial_bound(right):
         out.extend((name, op.start()) for name in _operand_names(left))
-    if left.strip() and not _TRIVIAL_BOUND_RE.match(left):
+    if left.strip() and not _is_trivial_bound(left):
         out.extend((name, op.start()) for name in _operand_names(right))
     return out
 
@@ -957,9 +966,9 @@ def _check_call_entries(masked: str, match: re.Match[str]) -> list[tuple[str, in
     (a_lo, a_hi), (b_lo, b_hi) = parsed[0][0], parsed[0][1]
     first, second = masked[a_lo:a_hi], masked[b_lo:b_hi]
     out: list[tuple[str, int]] = []
-    if not _TRIVIAL_BOUND_RE.match(second):
+    if not _is_trivial_bound(second):
         out.extend((n, match.start()) for n in _operand_names(first))
-    if not _TRIVIAL_BOUND_RE.match(first):
+    if not _is_trivial_bound(first):
         out.extend((n, match.start()) for n in _operand_names(second))
     return out
 

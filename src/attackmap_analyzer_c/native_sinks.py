@@ -447,7 +447,7 @@ _NUMERIC_RHS_RE = re.compile(
 )
 _INT_DECL_RE = re.compile(
     r"\b(?:(?:unsigned|signed|long|short|int|size_t|ssize_t|off_t|u?int(?:8|16|32|64)_t|DWORD|uint|ulong|"
-    r"std::size_t|socklen_t)\s+)+(?:const\s+)?([A-Za-z_]\w*)\s*[=;,\[)]"
+    r"std::size_t|socklen_t)\s+){1,4}(?:const\s+)?([A-Za-z_]\w*)\s*[=;,\[)]"
 )
 _CLAMP_RE = re.compile(r"\b(?:MIN|min|std::min|MG_MIN|g_min|qMin)\s*[(<]")
 _ALLOC_ASSIGN_RE = re.compile(
@@ -507,9 +507,10 @@ _MUL_RE = re.compile(r"[\w)\]]\s*(?:\*(?![*/=)])|<<(?!=))")
 _GETTEXT_RE = re.compile(r"^\s*(?:_|N_|gettext|dgettext|_T|TEXT|L|tr|QObject::tr)\s*\(")
 _ALL_CAPS_RE = re.compile(r"^\s*[A-Z][A-Z0-9_]*\s*$")
 # Literals only, possibly concatenated with macros (`"%" PRIu64 "\n"`);
-# `"ping " + host` is not constant. Each macro name is a whole word (`\b` on
-# both sides), so a long identifier can't be split 2^n ways.
-_LITERAL_ONLY_RE = re.compile(r"^\s*(?:u8|[uUL])?\"[^\"\n]*\"(?:\s*(?:(?:u8|[uUL])?\"[^\"\n]*\"|\b[A-Za-z_]\w*\b))*\s*$")
+# `"ping " + host` is not constant. A macro name is matched possessively and
+# never as a string prefix (`u8""` is a literal, not the macro `u8` then `""`),
+# so no input can be split more than one way.
+_LITERAL_ONLY_RE = re.compile(r"^\s*(?:u8|[uUL])?\"[^\"\n]*\"(?:\s*(?:(?:u8|[uUL])?\"[^\"\n]*\"|\b(?!(?:u8|[uUL])\")[A-Za-z_]\w*+))*\s*$")
 _LITERAL_START_RE = re.compile(r"^\s*(?:u8|[uUL])?\"")
 _CONVERSION_RE = re.compile(
     r"%(?:%|(?P<flags>[-+ #0']*)(?P<width>\*|\d+)?(?:\.(?P<prec>\*|\d+))?"

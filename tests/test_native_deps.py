@@ -270,6 +270,30 @@ def test_cmake_scans_are_linear() -> None:
     assert time.perf_counter() - start < 5
 
 
+
+def test_many_requirements_are_linear() -> None:
+    # Round-2 review: line numbers were found by walking the text from the
+    # top (or searching it) once per requirement.
+    import json
+    import time
+
+    n = 40000
+    txt = "[requires]\n" + "".join(f"pkg{i}/1.0\n" for i in range(n))
+    py = "class C:\n    def requirements(self):\n" + "".join(f'        self.requires("pkg{i}/1.0")\n' for i in range(n))
+    lock = json.dumps({"version": "0.5", "requires": [f"pkg{i}/1.0#abc%1" for i in range(n)]}, indent=1)
+    vcpkg = json.dumps({"name": "x", "dependencies": [f"pkg{i}" for i in range(n)]}, indent=1)
+    for parse, text, name in (
+        (parse_conanfile_txt, txt, "conanfile.txt"),
+        (parse_conanfile_py, py, "conanfile.py"),
+        (parse_conan_lock, lock, "conan.lock"),
+        (parse_vcpkg_json, vcpkg, "vcpkg.json"),
+    ):
+        start = time.perf_counter()
+        deps = parse(text, name)
+        assert time.perf_counter() - start < 5, name
+        assert len(deps) == n and deps[-1].line == text.count("\n", 0, text.index(f"pkg{n - 1}")) + 1, name
+
+
 # ---------- analyzer integration ----------
 
 

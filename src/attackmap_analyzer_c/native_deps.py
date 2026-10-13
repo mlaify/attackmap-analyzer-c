@@ -29,11 +29,12 @@ dedupes identical records.
 from __future__ import annotations
 
 import ast
+import bisect
 import json
 import re
 from pathlib import Path, PurePosixPath
 
-from attackmap.sdk import iter_repo_files, line_of, read_source, rel
+from attackmap.sdk import iter_repo_files, read_source, rel
 
 try:  # attackmap >= the release with the `cmake` ecosystem and SupplyChainIssue (AttackMap#191)
     from attackmap.sdk import DEPENDENCY_ECOSYSTEMS, DependencyHint, SupplyChainIssue
@@ -141,9 +142,32 @@ def _is_test_manifest(relative: str) -> bool:
     return any(p.lower() in _TEST_SEGMENTS for p in PurePosixPath(relative).parts[:-1])
 
 
-def _line(text: str, needle: str) -> int | None:
-    index = text.find(needle)
-    return line_of(text, index) if index >= 0 else None
+_NEWLINE_RE = re.compile(r"\n")
+# A JSON string literal (unterminated: up to the end of the line).
+_JSON_STRING_RE = re.compile(r'"((?:[^"\\\n]|\\.)*)"?')
+
+
+class _Lines:
+    """Line numbers for one text from a line-start table built once, so
+    each lookup is a bisect instead of a scan from the top."""
+
+    def __init__(self, text: str) -> None:
+        self.starts = [0, *(m.end() for m in _NEWLINE_RE.finditer(text))]
+
+    def line(self, offset: int) -> int:
+        return bisect.bisect_right(self.starts, max(0, offset))
+
+    def offset(self, lineno: int, col: int = 0) -> int:
+        return self.starts[min(max(lineno, 1), len(self.starts)) - 1] + max(0, col)
+
+
+def _string_offsets(text: str) -> dict[str, int]:
+    """Offset of the first JSON string literal with each raw content, in one
+    pass, so a lookup per dependency doesn't search the whole text."""
+    out: dict[str, int] = {}
+    for match in _JSON_STRING_RE.finditer(text):
+        out.setdefault(match.group(1), match.start())
+    return out
 
 
 # ---------- vcpkg ----------
@@ -166,6 +190,8 @@ def parse_vcpkg_json(text: str, relative: str) -> list:
             if isinstance(version, str):
                 overrides[item["name"]] = version
     dev_manifest = _is_test_manifest(relative)
+    lines = _Lines(text)
+    strings = _string_offsets(text)
     out = []
     for item in _list(data.get("dependencies")):
         if isinstance(item, str):
@@ -182,7 +208,7 @@ def parse_vcpkg_json(text: str, relative: str) -> list:
             version, resolved, how = "", False, "baseline"
         evidence = f"vcpkg {name} ({how}" + (f", builtin-baseline {baseline}" if isinstance(baseline, str) else "") + ")"
         out.append(DependencyHint(
-            name=name, version=version, ecosystem="vcpkg", file=relative, line=_line(text, f'"{name}"'),
+            name=name, version=version, ecosystem="vcpkg", file=relative, line=lines.line(strings[name]) if name in strings else None,
             dev=host or dev_manifest, resolved=resolved, evidence_text=evidence,
         ))
     return out
@@ -191,10 +217,10 @@ def parse_vcpkg_json(text: str, relative: str) -> list:
 # ---------- Conan ----------
 
 
-def _conan_hint(ref: re.Match[str], text: str, relative: str, dev: bool, offset: int, resolved: bool = False):
+def _conan_hint(ref: re.Match[str], lines: _Lines, relative: str, dev: bool, offset: int, resolved: bool = False):
     version = ref.group(2)
     return DependencyHint(
-        name=ref.group(1), version=version, ecosystem="conan", file=relative, line=line_of(text, offset),
+        name=ref.group(1), version=version, ecosystem="conan", file=relative, line=lines.line(offset),
         dev=dev, resolved=resolved and not version.startswith("["), evidence_text=ref.group(0),
     )
 
@@ -202,6 +228,7 @@ def _conan_hint(ref: re.Match[str], text: str, relative: str, dev: bool, offset:
 def parse_conanfile_txt(text: str, relative: str) -> list:
     out = []
     dev_manifest = _is_test_manifest(relative)
+    lines = _Lines(text)
     sections = list(_CONAN_SECTION_RE.finditer(text))
     for i, section in enumerate(sections):
         kind = section.group(1)
@@ -213,7 +240,7 @@ def parse_conanfile_txt(text: str, relative: str) -> list:
             line = raw_line.split("#", 1)[0]
             ref = _CONAN_REF_RE.search(line)
             if ref is not None:
-                out.append(_conan_hint(ref, text, relative, kind in _DEV_SECTIONS or dev_manifest, offset + ref.start()))
+                out.append(_conan_hint(ref, lines, relative, kind in _DEV_SECTIONS or dev_manifest, offset + ref.start()))
             offset += len(raw_line)
     return out
 
@@ -228,6 +255,7 @@ def parse_conanfile_py(text: str, relative: str) -> list:
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return []
     dev_manifest = _is_test_manifest(relative)
+    lines = _Lines(text)
     out = []
 
     def literal_refs(node: ast.AST) -> list[ast.Constant]:
@@ -241,8 +269,8 @@ def parse_conanfile_py(text: str, relative: str) -> list:
         for constant in constants:
             ref = _CONAN_REF_RE.fullmatch(constant.value)
             if ref is not None:
-                offset = _offset_of(text, constant.lineno, constant.col_offset)
-                out.append(_conan_hint(ref, text, relative, kind in _DEV_SECTIONS or dev_manifest, offset))
+                offset = lines.offset(constant.lineno, constant.col_offset)
+                out.append(_conan_hint(ref, lines, relative, kind in _DEV_SECTIONS or dev_manifest, offset))
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -261,16 +289,6 @@ def parse_conanfile_py(text: str, relative: str) -> list:
     return out
 
 
-def _offset_of(text: str, lineno: int, col: int) -> int:
-    offset = 0
-    for _ in range(lineno - 1):
-        newline = text.find("\n", offset)
-        if newline == -1:
-            return offset
-        offset = newline + 1
-    return offset + col
-
-
 def parse_conan_lock(text: str, relative: str) -> list:
     """Conan 2 (``requires`` / ``build_requires`` lists) and Conan 1.x
     (``graph_lock.nodes``, build-context nodes are ``dev``) lockfiles."""
@@ -286,11 +304,13 @@ def parse_conan_lock(text: str, relative: str) -> list:
         for node in nodes.values():
             if isinstance(node, dict) and isinstance(node.get("ref"), str):
                 entries.append((node["ref"], node.get("context") == "build"))
+    lines = _Lines(text)
+    strings = _string_offsets(text)
     out = []
     for entry, dev in entries:
         ref = _CONAN_REF_RE.match(entry)
         if ref is not None:
-            out.append(_conan_hint(ref, text, relative, dev, max(0, text.find(entry)), resolved=True))
+            out.append(_conan_hint(ref, lines, relative, dev, strings.get(entry, 0), resolved=True))
     return out
 
 
@@ -419,12 +439,13 @@ def parse_cmake(text: str, relative: str) -> tuple[list, list]:
     deps: list = []
     issues: list = []
     dev_manifest = _is_test_manifest(relative)
+    lines = _Lines(text)
     for match in _CMAKE_COMMAND_RE.finditer(bare):
         command = match.group(1).lower()
         args = _cmake_args(clean, match.end() - 1, pairs)
         if not args:
             continue
-        line = line_of(text, match.start())
+        line = lines.line(match.start())
         if command == "find_package":
             dep = _find_package(args, relative, line, dev_manifest)
             if dep is not None:

@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - CMake: `FetchContent_Declare`, `ExternalProject_Add`, `CPMAddPackage` and `find_package`.
 
   `--cve` now reaches Conan and vcpkg dependencies. CMake ones are inventory-only. Git downloads on a branch or with no `GIT_TAG`, and archive URLs without `URL_HASH`, are reported as `mutable_vcs_dependency` supply-chain issues. Requires an AttackMap core with the `cmake` ecosystem and `SupplyChainIssue` in `attackmap.sdk` (mlaify/AttackMap#333).
+- **Memory-safety and command-exec sinks (mlaify/AttackMap#189).** A new `native_sinks.py` pass emits `CodeWeakness` records for:
+  - `unbounded_copy`: `gets`, unbounded `scanf` `%s`, and `strcpy`/`strcat`/`sprintf` from traced input;
+  - `format_string`: non-constant printf-family formats;
+  - `native_command_exec`: `system`/`popen`/`exec*`;
+  - `tainted_copy_length`: input-controlled `memcpy` lengths;
+  - `alloc_size_overflow`: unchecked `malloc(n * size)`.
+
+  Sources are traced inside each function: civetweb, mongoose and libmicrohttpd request accessors, socket reads, stdin, argv, getenv and file reads. Severity and confidence follow the source: remote input high, local input medium, untraced low. Example code is capped at low and test/fuzz code is skipped. Validated on civetweb, mongoose, cpp-httplib, drogon, Crow, restbed and oat++ example-crud. Requires an AttackMap core that exports `CodeWeakness` (mlaify/AttackMap#333).
 
 ### Changed
 

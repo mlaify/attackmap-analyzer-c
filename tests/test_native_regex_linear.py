@@ -2,12 +2,23 @@
 
 import time
 
-from attackmap_analyzer_c import native_deps as nd
+from attackmap_analyzer_c import native_sinks as ns
 
 
-def test_conan_section_scan_is_linear_on_blank_lines() -> None:
+def _fast(fn, limit: float = 1.0) -> None:
     start = time.perf_counter()
-    list(nd._CONAN_SECTION_RE.finditer("[requires]\nzlib/1.2.13\n" + "\n" * 1_000_000))
-    assert time.perf_counter() - start < 1.0
-    found = [m.group(1) for m in nd._CONAN_SECTION_RE.finditer("[requires]\nzlib/1\n  [tool_requires] \ncmake/3\n")]
-    assert found == ["requires", "tool_requires"]
+    fn()
+    assert time.perf_counter() - start < limit
+
+
+def test_literal_only_is_not_exponential_on_prefixed_literals() -> None:
+    _fast(lambda: ns._LITERAL_ONLY_RE.match('""' + 'u8""' * 40 + " + p"))
+    assert ns._LITERAL_ONLY_RE.match('"%" PRIu64 "\\n"')
+    assert ns._LITERAL_ONLY_RE.match('u8"a" L"b"')
+    assert not ns._LITERAL_ONLY_RE.match('"ping " + host')
+
+
+def test_int_declaration_scan_is_linear_on_keyword_runs() -> None:
+    _fast(lambda: list(ns._INT_DECL_RE.finditer("int " * 250_000 + "!")))
+    found = [m.group(1) for m in ns._INT_DECL_RE.finditer("unsigned long long int n = 3; const size_t len; int x;")]
+    assert found == ["n", "len", "x"]

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Memory-safety and command-exec sinks (mlaify/AttackMap#189).** A new `native_sinks.py` pass emits `CodeWeakness` records for:
+  - `unbounded_copy`: `gets`, unbounded `scanf` `%s`, and `strcpy`/`strcat`/`sprintf` from traced input;
+  - `format_string`: non-constant printf-family formats;
+  - `native_command_exec`: `system`/`popen`/`exec*`;
+  - `tainted_copy_length`: input-controlled `memcpy` lengths;
+  - `alloc_size_overflow`: unchecked `malloc(n * size)`.
+
+  Sources are traced inside each function: civetweb, mongoose and libmicrohttpd request accessors, socket reads, stdin, argv, getenv and file reads. Severity and confidence follow the source: remote input high, local input medium, untraced low. Example code is capped at low and test/fuzz code is skipped. Validated on civetweb, mongoose, cpp-httplib, drogon, Crow, restbed and oat++ example-crud. Requires an AttackMap core that exports `CodeWeakness` (mlaify/AttackMap#333).
+
 ### Changed
 
 - Walk and read the repo with the shared `attackmap.sdk` helpers (`iter_repo_files`, `read_source`, `rel`, `line_of`) instead of a local `rglob` + `SKIP_DIRS` walk (mlaify/AttackMap#253).

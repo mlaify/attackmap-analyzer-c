@@ -77,7 +77,7 @@ _TEST_SEGMENTS = frozenset({"test", "tests", "testing", "unittest", "unittests",
 # Conan
 _CONAN_REF_RE = re.compile(r"\b([A-Za-z0-9_][A-Za-z0-9_.+-]{0,100})/(\[[^\]\n]{1,80}\]|[A-Za-z0-9_.+~-]{1,64})"
                            r"(?:@[\w.+-]{1,64}/[\w.+-]{1,64})?(?:#[0-9a-f]{1,64})?")
-_CONAN_SECTION_RE = re.compile(r"^\s*\[([a-z_]+)\]\s*$", re.MULTILINE)
+_CONAN_SECTION_RE = re.compile(r"^[ \t]*\[([a-z_]+)\][ \t]*$", re.MULTILINE)
 _CONAN_REQUIRE_NAMES = frozenset({"requires", "tool_requires", "build_requires", "test_requires"})
 _DEV_SECTIONS = frozenset({"tool_requires", "build_requires", "test_requires"})
 

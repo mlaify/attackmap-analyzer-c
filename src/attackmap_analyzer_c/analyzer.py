@@ -30,22 +30,26 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
-
-from .native_deps import MANIFEST_NAMES, MANIFEST_SUFFIXES, dedupe_dependencies, is_manifest, manifest_records
-from .native_sinks import find_native_weaknesses
-from .contracts import (
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
     DatabaseHint,
     EntrypointHint,
     ExternalCall,
     FrameworkHint,
+    iter_repo_files,
+    line_of,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
     ServiceHint,
 )
+
+from .native_deps import MANIFEST_NAMES, MANIFEST_SUFFIXES, dedupe_dependencies, is_manifest, manifest_records
+from .native_sinks import find_native_weaknesses
 
 CODE_SUFFIXES = {".c", ".h"}
 # C-specific additions to the shared skip list (which already covers build/,

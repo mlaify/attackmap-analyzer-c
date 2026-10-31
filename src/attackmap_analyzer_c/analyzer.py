@@ -196,7 +196,7 @@ class CAnalyzer:
     metadata = AnalyzerMetadata(
         name="c",
         display_name="C Analyzer",
-        version="0.1.0",
+        version="0.2.0",
         description="C ecosystem analyzer covering libmicrohttpd, civetweb, mongoose, libonion, libcurl, OpenSSL, libsodium, sqlite3, libpq, mysql, hiredis, mongoc, plus memory-safety and command-exec sinks.",
         scope="C source trees and CMake/Make projects. Detects HTTP server entrypoints, libcurl outbound calls, common DB and crypto libraries, and function-local memory-safety / format-string / command-exec sinks tied to request and input sources.",
         targets=["c", "civetweb", "libmicrohttpd", "mongoose"],

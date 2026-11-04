@@ -26,6 +26,9 @@ All emissions populate AttackMap's Signal v2 fields (line numbers + evidence sni
 ## Install
 
 ```bash
+uv tool install attackmap --with attackmap-analyzer-c \
+  --index mlaify=https://pkg.mlaify.io/pypi/simple/ --index-strategy first-index
+# or from source:
 pip install git+https://github.com/mlaify/attackmap-analyzer-c.git
 ```
 

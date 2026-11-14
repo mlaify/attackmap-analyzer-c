@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — packaging
+- Depends on `attackmap>=0.6.0,<1.0.0` (it was only in the `core` extra), so `pip install attackmap-analyzer-c`
+  installs a working analyzer on its own. The `core` extra stays for existing installs.
+- On PyPI: `release.yml` uploads each release's files there with trusted publishing; the README
+  installs from PyPI instead of the pkg.mlaify.io index.
+
 ## [0.2.0] - 2026-10-31
 
 ### Changed — packaging

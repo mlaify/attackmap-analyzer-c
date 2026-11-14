@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "attackmap-analyzer-c"
-version = "0.2.0"
+version = "0.2.1"
 description = "C ecosystem analyzer plugin for AttackMap (libmicrohttpd, civetweb, mongoose; libcurl; OpenSSL/mbedTLS/libsodium; sqlite3/libpq/mysql/hiredis/mongoc)."
 readme = "README.md"
 requires-python = ">=3.11"

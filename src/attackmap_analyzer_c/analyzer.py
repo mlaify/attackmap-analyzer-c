@@ -197,7 +197,7 @@ class CAnalyzer:
     metadata = AnalyzerMetadata(
         name="c",
         display_name="C Analyzer",
-        version=plugin_version("attackmap-analyzer-c", default="0.2.1"),
+        version=plugin_version("attackmap-analyzer-c", default="0.3.0"),
         requires_core=">=0.8,<2",
         description="C ecosystem analyzer covering libmicrohttpd, civetweb, mongoose, libonion, libcurl, OpenSSL, libsodium, sqlite3, libpq, mysql, hiredis, mongoc, plus memory-safety and command-exec sinks.",
         scope="C source trees and CMake/Make projects. Detects HTTP server entrypoints, libcurl outbound calls, common DB and crypto libraries, and function-local memory-safety / format-string / command-exec sinks tied to request and input sources.",
